@@ -28,6 +28,11 @@ bite you.
   one shared `sys.path`, so a generic `overlay.py` / `utils.py` would collide with another plugin's
   same-named module — first import wins, silently. Import them top-level (`import edta_core`);
   package-relative imports (`from . import core`) fail, because EDMC imports `load.py` directly.
+- **The overlay message id is `tradeasst_block`, deliberately NOT `edta_`.** This looks like an
+  oversight next to the rule above and is not: EDMCModernOverlay applies a position-normalising
+  group transform to any message id matching a registered plugin group, and an unregistered prefix
+  is what keeps the x/y we send honoured. Module prefixes and overlay id prefixes are different
+  namespaces solving different problems.
 - **Never create a folder named `config/`** inside the plugin — it shadows EDMC's own `config`
   module. (A sibling project did this and had to rename to `plugin_config/`.)
 - `__version__` in `load.py` is the single source of truth. The git tag must match it.
@@ -111,7 +116,28 @@ python package.py                # dist/EDTradeAssist-v<version>.zip
 Regenerate the commodity table when Frontier adds commodities:
 `python tools/build_commodities.py`.
 
+## Releasing
+
+Repo: <https://github.com/mcjohnso/ed-trade-assist> (`main`). CI compile-checks every module and
+runs the suite on each push; a `v*` tag builds the zip and publishes a GitHub Release.
+
+```bash
+# 1. bump __version__ in EDTradeAssist/load.py, add a CHANGELOG section
+git commit -am "Release vX.Y.Z"
+git tag vX.Y.Z && git push origin main --tags
+gh run watch --exit-status && gh release view vX.Y.Z
+```
+
+The tag must match `__version__` or the zip name and the release will not line up. Pushing the tag
+publishes immediately — push the branch alone first if you want to land code without releasing.
+
 ## Etiquette
 
 Ardent publishes no rate limit; absence of one is not permission. The client self-limits to one
-request a second, caches for 300 s, and a search only happens on docking or an explicit Re-search.
+request a second and caches for 300 s, and a search only happens on docking or an explicit
+Re-search.
+
+Note that a search is now up to `MAX_RINGS + 1` requests rather than one, so a worst-case search
+(nothing qualifies anywhere) costs about six seconds and six requests. That is the price of not
+being lied to by the row cap, but it is the reason to keep `MAX_RINGS` small and to stop expanding
+as soon as something fresh turns up.

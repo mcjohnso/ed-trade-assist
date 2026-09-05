@@ -18,7 +18,6 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import edta_ardent          # for ROW_CAP only; its network deps are imported lazily
 import edta_commodities
 import edta_core as core
 
