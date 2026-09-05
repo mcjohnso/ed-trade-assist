@@ -1,0 +1,34 @@
+# EDMC's runtime modules (config, myNotebook, theme, edmcoverlay) aren't
+# installed on the runner, so load.py cannot be imported here — compileall
+# catches syntax errors, and the pure-logic modules self-test on their own.
+# smoke_test.py needs a display, so it stays a local check.
+name: Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Compile-check all modules
+        run: python -m compileall -q .
+
+      - name: Core self-tests
+        run: |
+          python EDTradeAssist/edta_core.py
+          python EDTradeAssist/edta_commodities.py
+          python EDTradeAssist/edta_ardent.py
+          python EDTradeAssist/edta_overlay.py
+          python EDTradeAssist/edta_session.py
+
+      - name: Unit tests
+        run: python tests/test_core.py
