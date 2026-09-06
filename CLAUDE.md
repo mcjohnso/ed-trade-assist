@@ -102,6 +102,13 @@ the last moment it is alive. `MarketBuy` overrides it when seen.
 `ledger.runs` increments **only when `state == TO_SELL`** on docking home. Any other state means we
 were not carrying cargo back: the first Start, or a re-dock while still shopping.
 
+**Nothing draws on the in-game overlay unless a run is in progress.** `redraw()` clears rather than
+shows when the colour role is `"off"`, and that is the only thing keeping the stop summary out of the
+game. The summary rides on `session.message`, and redraw's `if not lines and state.message` fallback
+feeds the panel *and* the overlay — so a single `clear()` at Stop does not settle it: `on_journal`
+returns a `REDRAW` for every event while stopped, and each one would re-post the summary for its full
+8 s TTL. `smoke_test.py` fires three events after Stop and asserts the overlay stays blank.
+
 ## Ranking
 
 Order: age band, round-trip jumps, arrival-distance band (Ls), landing pad (bigger wins), price.

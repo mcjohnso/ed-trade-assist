@@ -405,9 +405,11 @@ class Session:
         self.target = None
         self.outcome = None
         # The totals go out through `message`: display_lines() is empty for OFF,
-        # and redraw() falls back to the message when there are no lines. The
-        # overlay is cleared by load.py immediately after, so this lands in the
-        # EDMC panel only - which is right, the run is over.
+        # and redraw() falls back to the message when there are no lines.
+        # That fallback feeds BOTH surfaces, so keeping this out of the game
+        # depends on redraw() drawing nothing at all while the role is "off".
+        # Do not assume a single clear() at Stop is enough - journal events keep
+        # redrawing after the run ends.
         self.message = self.ledger.summary(now or datetime.now(timezone.utc))
         self.note = ""
         self.ledger = Ledger()

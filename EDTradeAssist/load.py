@@ -200,9 +200,17 @@ class Plugin:
             self.overlay.set_position(*edta_settings.overlay_position())
             self.overlay.set_size(edta_settings.overlay_size())
             self.overlay.set_enabled(True)
-            colour = {"buy": edta_overlay.COLOR_BUY, "sell": edta_overlay.COLOR_SELL}.get(
-                role, edta_overlay.COLOR_WARN)
-            self.overlay.show(lines, colour)
+            if role == "off":
+                # Nothing draws in the game unless a run is in progress. The
+                # panel goes on showing `message` - the stop summary - but the
+                # overlay must not, and cannot simply be cleared once at Stop:
+                # every journal event redraws while stopped too, and the fallback
+                # above would put the summary back for its whole TTL each time.
+                self.overlay.clear()
+            else:
+                colour = {"buy": edta_overlay.COLOR_BUY, "sell": edta_overlay.COLOR_SELL}.get(
+                    role, edta_overlay.COLOR_WARN)
+                self.overlay.show(lines, colour)
         else:
             self.overlay.set_enabled(False)
 

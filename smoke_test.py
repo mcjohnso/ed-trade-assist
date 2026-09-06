@@ -269,6 +269,20 @@ def main() -> int:
     assert "Session ended: " in plugin.detail_var.get(), plugin.detail_var.get()
     print("stop OK -> {!r}".format(plugin.detail_var.get()))
 
+    # ...but it must not go back onto the in-game overlay. Every journal event
+    # redraws even while stopped, and redraw() falls back to session.message
+    # when there are no lines - so without a guard the summary reappears on the
+    # overlay for its whole TTL, again and again, long after the run ended.
+    before = len(SENT)
+    for event in ({"event": "FSDJump", "StarSystem": "Sol", "StarPos": [0.0, 0.0, 0.0]},
+                  {"event": "Undocked", "StarSystem": "Sol"},
+                  {"event": "Docked", "StarSystem": "Sol", "StationName": "Abraham Lincoln",
+                   "MarketID": 128016384}):
+        load.journal_entry("CMDR Test", False, "Sol", "Abraham Lincoln", event, {})
+    drawn = [s for s in SENT[before:] if s[1]]
+    assert not drawn, "stopped session drew on the overlay: {}".format(drawn)
+    print("stopped session draws nothing on the overlay OK")
+
     load.plugin_stop()
     print("plugin_stop OK")
 
