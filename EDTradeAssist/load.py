@@ -30,7 +30,7 @@ import edta_overlay
 import edta_session as session_mod
 import edta_settings
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 plugin_version = __version__
 
 PLUGIN_NAME = "EDTradeAssist"
@@ -520,7 +520,7 @@ def _refresh_sell_price(entry: Dict[str, Any]) -> None:
 
 def _names_match(journal_name: str, ardent_name: str) -> bool:
     """Market.json spells commodities '$gold_name;'; Ardent spells them 'gold'."""
-    return edta_commodities.lookup_key(journal_name) == edta_commodities.lookup_key(ardent_name)
+    return edta_commodities.same_commodity(journal_name, ardent_name)
 
 
 def _read_market_json(market_id: Optional[int]) -> Optional[Dict[str, Any]]:

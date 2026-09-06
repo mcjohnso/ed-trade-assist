@@ -156,6 +156,45 @@ def human_ls(ls: Optional[float]) -> str:
     return "{:,.1f}k Ls".format(ls / 1000.0)
 
 
+def human_duration(seconds: Optional[float]) -> str:
+    """A SPAN of time, not an age. human_age() cannot be reused for this: its
+    ' ago' suffix is hard-coded and its bands are tuned for staleness.
+
+    The minor unit is zero-padded so the field keeps its width and the overlay
+    line does not shuffle sideways every time a minute ticks over.
+    """
+    if seconds is None:
+        return "?"
+    seconds = max(0.0, float(seconds))
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return "{}m".format(minutes)
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return "{}h{:02d}m".format(hours, minutes)
+    days, hours = divmod(hours, 24)
+    return "{}d{:02d}h".format(days, hours)
+
+
+def human_credits(value: Optional[float]) -> str:
+    """Compact credits, because the session line carries four fields.
+
+    Negatives carry a '-' but positives carry no '+', unlike profit_lines()
+    below: that signs a per-run DELTA, where the sign is the whole decision.
+    These are totals and rates, where a leading plus is just noise. human_ls()
+    is the precedent for spelling the magnitude with a suffix.
+    """
+    if value is None:
+        return "? cr"
+    magnitude = abs(float(value))
+    sign = "-" if value < 0 else ""
+    if magnitude < 1_000_000:
+        return "{}{:,.0f} cr".format(sign, magnitude)
+    if magnitude < 1_000_000_000:
+        return "{}{:,.1f}M cr".format(sign, magnitude / 1_000_000.0)
+    return "{}{:,.2f}B cr".format(sign, magnitude / 1_000_000_000.0)
+
+
 def thousands(value: Optional[float]) -> str:
     return "?" if value is None else "{:,}".format(int(value))
 
@@ -412,6 +451,36 @@ def profit_lines(buy_price: int, sell_price: Optional[int],
     return ["{:+,} cr/t - {:+,} cr/full hold".format(per_tonne, per_tonne * cargo_capacity)]
 
 
+#: Below this, extrapolating an hourly rate is fantasy - a full hold sold forty
+#: seconds after Start would read as a billion an hour. The rate shows as
+#: "? cr/hr" until enough time has passed for it to mean anything.
+RATE_MIN_SECONDS = 300.0
+
+
+def session_lines(elapsed_seconds: Optional[float], runs: int, credits: int,
+                  estimated: bool = False) -> List[str]:
+    """The realised total for the session so far, as at most one line.
+
+    Primitives in, strings out - the same split as profit_lines() above: core
+    decides how a figure is spelled, the session decides whether to ask. The
+    caller gates on having made a sale at all; this only refuses to divide by a
+    length of time it cannot use.
+    """
+    if elapsed_seconds is None:
+        return []
+    mark = "~" if estimated else ""
+    fields = [human_duration(elapsed_seconds)]
+    if runs:
+        fields.append("1 run" if runs == 1 else "{} runs".format(runs))
+    fields.append(mark + human_credits(credits))
+    if elapsed_seconds >= RATE_MIN_SECONDS:
+        rate = credits * 3600.0 / elapsed_seconds
+        fields.append(mark + human_credits(rate) + "/hr")
+    else:
+        fields.append(human_credits(None) + "/hr")
+    return ["Session: " + " - ".join(fields)]
+
+
 # --- self-test ---------------------------------------------------------------
 
 def _self_test() -> None:
@@ -526,6 +595,32 @@ def _self_test() -> None:
     assert human_ls(50) == "50 Ls" and human_ls(1500) == "1.5k Ls"
     assert profit_lines(40000, 0, 720) == []
     assert profit_lines(40000, 45000, 720) == ["+5,000 cr/t - +3,600,000 cr/full hold"]
+
+    assert human_duration(None) == "?"
+    assert human_duration(-5) == "0m" and human_duration(0) == "0m"
+    assert human_duration(59) == "0m" and human_duration(90) == "1m"
+    assert human_duration(3599) == "59m" and human_duration(3600) == "1h00m"
+    assert human_duration(4320) == "1h12m" and human_duration(5430) == "1h30m"
+    assert human_duration(86400) == "1d00h" and human_duration(183600) == "2d03h"
+
+    assert human_credits(None) == "? cr"
+    assert human_credits(0) == "0 cr" and human_credits(42000) == "42,000 cr"
+    assert human_credits(-1500) == "-1,500 cr"
+    assert human_credits(18_400_000) == "18.4M cr"
+    assert human_credits(-18_400_000) == "-18.4M cr"
+    assert human_credits(1_050_000_000) == "1.05B cr"
+
+    # The approved overlay line, exactly.
+    assert session_lines(4320.0, 4, 18_400_000) == [
+        "Session: 1h12m - 4 runs - 18.4M cr - 15.3M cr/hr"], session_lines(4320.0, 4, 18_400_000)
+    assert session_lines(None, 0, 0) == []
+    # Start pressed mid-haul: no completed round trip yet, so no runs field.
+    assert "runs" not in session_lines(4320.0, 0, 18_400_000)[0]
+    assert session_lines(3600.0, 1, 1_000_000)[0].count(" - 1 run - ") == 1
+    # Too early to extrapolate, and the zero case cannot divide by zero.
+    assert session_lines(0.0, 1, 500_000) == ["Session: 0m - 1 run - 500,000 cr - ? cr/hr"]
+    assert "? cr/hr" in session_lines(60.0, 1, 500_000)[0]
+    assert session_lines(3600.0, 1, 1_000_000, estimated=True)[0].count("~") == 2
 
     lines = describe_candidate(rank_candidates([row()], spec, now=now)[0], spec)
     assert lines[0] == "BUY Gold @ Port" and "est" in lines[1]

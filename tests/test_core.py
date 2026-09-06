@@ -539,6 +539,277 @@ class Escalation(unittest.TestCase):
         self.assertEqual(len(outcome.attempts), 0)
 
 
+class SessionLedger(unittest.TestCase):
+    """The realised-profit arithmetic on its own - no Session, no fixture.
+
+    The theoretical profit line answers "what should this run be worth". This
+    answers "what has it actually paid", which is a different number and the one
+    a cr/hr figure has to be built from.
+    """
+
+    def setUp(self):
+        self.start = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
+        self.ledger = session_mod.Ledger(started_at=self.start)
+
+    def test_profit_accumulates_across_sales(self):
+        self.ledger.record_sale(39_600_000, 720, 45595)
+        self.ledger.record_sale(20_000_000, 400, 45000)
+        self.assertEqual(self.ledger.credits,
+                         (39_600_000 - 45595 * 720) + (20_000_000 - 45000 * 400))
+        self.assertEqual(self.ledger.tonnes, 1120)
+        self.assertEqual(self.ledger.sales, 2)
+
+    def test_the_rate_is_credits_per_hour(self):
+        self.ledger.record_sale(12_000_000, 100, 0, no_cost_basis=True)
+        rate = self.ledger.per_hour(self.start + timedelta(hours=3))
+        self.assertAlmostEqual(rate, 4_000_000.0)
+
+    def test_zero_elapsed_time_does_not_divide_by_zero(self):
+        self.ledger.record_sale(5_000_000, 100, 1000)
+        self.assertIsNone(self.ledger.per_hour(self.start))
+        line = core.session_lines(self.ledger.elapsed_seconds(self.start),
+                                  self.ledger.runs, self.ledger.credits)[0]
+        self.assertIn("? cr/hr", line)
+
+    def test_a_short_session_does_not_extrapolate(self):
+        """One hold sold a minute in would otherwise read as billions an hour."""
+        self.ledger.record_sale(18_400_000, 720, 100)
+        line = core.session_lines(60.0, 1, self.ledger.credits)[0]
+        self.assertIn("? cr/hr", line)
+
+    def test_a_missing_avg_price_paid_falls_back_to_the_buy_price(self):
+        self.ledger.buy_price_basis = 45595
+        self.ledger.record_sale(39_600_000, 720, None)
+        self.assertEqual(self.ledger.credits, 39_600_000 - 45595 * 720)
+        self.assertTrue(self.ledger.estimated)
+
+    def test_a_zero_avg_price_paid_is_treated_as_absent(self):
+        """Not as free cargo - a zero here means the journal did not say."""
+        self.ledger.buy_price_basis = 1000
+        self.ledger.record_sale(5_000_000, 100, 0)
+        self.assertEqual(self.ledger.credits, 5_000_000 - 100_000)
+        self.assertTrue(self.ledger.estimated)
+
+    def test_no_cost_basis_at_all_counts_the_whole_sale(self):
+        self.ledger.record_sale(5_000_000, 100, None)
+        self.assertEqual(self.ledger.credits, 5_000_000)
+        self.assertTrue(self.ledger.estimated)
+
+    def test_stolen_cargo_has_no_cost_and_is_not_charged_one(self):
+        """Subtracting a price never paid would print a loss that never happened."""
+        self.ledger.buy_price_basis = 45595
+        self.ledger.record_sale(5_000_000, 100, None, no_cost_basis=True)
+        self.assertEqual(self.ledger.credits, 5_000_000)
+        self.assertFalse(self.ledger.estimated)
+
+    def test_a_clock_stepping_backwards_does_not_go_negative(self):
+        self.assertEqual(self.ledger.elapsed_seconds(self.start - timedelta(hours=1)), 0.0)
+
+    def test_a_ledger_that_never_started_has_no_elapsed_time(self):
+        blank = session_mod.Ledger()
+        self.assertIsNone(blank.elapsed_seconds(self.start))
+        self.assertEqual(blank.lines(self.start), [])
+
+    def test_a_sale_from_before_the_session_is_a_replay(self):
+        self.assertTrue(self.ledger.is_replay(self.start - timedelta(minutes=40)))
+        self.assertFalse(self.ledger.is_replay(self.start - timedelta(seconds=5)))
+        self.assertFalse(self.ledger.is_replay(self.start + timedelta(minutes=40)))
+        self.assertFalse(self.ledger.is_replay(None))
+
+
+class SessionProfitFromJournal(unittest.TestCase):
+    """The same ledger, driven through the real state machine by real events."""
+
+    def setUp(self):
+        self.rows = load_fixture()
+        self.now = fixture_now(self.rows)
+        self.session = session_mod.Session()
+        params = session_mod.Params(sell_system="Sol", commodity="Gold",
+                                    cargo_capacity="200", unladen_range="50",
+                                    laden_range="40", min_pad="M")
+        validation, self.effects = self.session.start(params, now=self.now)
+        self.assertTrue(validation.ok)
+
+    def stamp(self, minutes=1):
+        return (self.now + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+
+    def search_and_apply(self, effects):
+        """Run the search the session just asked for, and hand back the answer."""
+        generation, search_spec = effects[-1].payload
+        outcome = session_mod.search_best(
+            search_spec,
+            lambda r, d: edta_ardent.SearchResult(edta_ardent.OK, rows=self.rows),
+            now=self.now)
+        self.session.apply_outcome(generation, outcome)
+        return self.session.target
+
+    def dock_at_buy(self, target):
+        self.session.on_journal(
+            {"event": "Docked", "StarSystem": target.system,
+             "StationName": target.station, "MarketID": target.market_id}, {})
+        self.assertEqual(self.session.state, session_mod.TO_SELL)
+
+    def reach_to_sell(self):
+        """Search, then dock at the buy station - laden and headed home."""
+        target = self.search_and_apply(self.effects)
+        self.dock_at_buy(target)
+        return target
+
+    def dock_home(self):
+        return self.session.on_journal(
+            {"event": "Docked", "StarSystem": "Sol", "StationName": "Abraham Lincoln",
+             "MarketID": 128016384}, {})
+
+    def sell(self, minutes=30, **overrides):
+        entry = {"event": "MarketSell", "timestamp": self.stamp(minutes),
+                 "Type": "gold", "Count": 200, "SellPrice": 55000,
+                 "TotalSale": 11_000_000, "AvgPricePaid": 45595}
+        entry.update(overrides)
+        return self.session.on_journal(entry, {})
+
+    def test_a_marketsell_of_the_tracked_commodity_adds_profit(self):
+        self.reach_to_sell()
+        self.dock_home()
+        effects = self.sell()
+        self.assertEqual(self.session.ledger.credits, 11_000_000 - 45595 * 200)
+        self.assertIn(session_mod.REDRAW, [e.kind for e in effects])
+
+    def test_a_sale_of_an_untracked_commodity_is_ignored(self):
+        self.reach_to_sell()
+        self.dock_home()
+        self.sell(Type="silver")
+        self.assertEqual(self.session.ledger.credits, 0)
+        self.assertEqual(self.session.ledger.sales, 0)
+
+    def test_the_journal_spelling_of_the_commodity_still_matches(self):
+        """The journal writes '$gold_name;' where Ardent writes 'gold'."""
+        self.reach_to_sell()
+        self.dock_home()
+        self.sell(Type="$gold_name;")
+        self.assertEqual(self.session.ledger.sales, 1)
+
+    def test_a_run_is_counted_when_the_cargo_gets_home(self):
+        self.reach_to_sell()
+        self.dock_home()
+        self.assertEqual(self.session.ledger.runs, 1)
+
+    def test_re_docking_in_the_sell_system_does_not_count_a_run(self):
+        """Only arriving laden counts. Starting here, or re-docking while still
+        shopping, is not a completed round trip."""
+        self.dock_home()
+        self.dock_home()
+        self.assertEqual(self.session.ledger.runs, 0)
+
+    def test_a_sale_without_avgpricepaid_uses_the_price_paid_at_the_buy_station(self):
+        """self.target is already None by sale time, so the basis has to have
+        been seeded at the turnaround."""
+        target = self.reach_to_sell()
+        self.dock_home()
+        self.assertIsNone(self.session.target)
+        self.sell(AvgPricePaid=None)
+        self.assertEqual(self.session.ledger.credits, 11_000_000 - target.buy_price * 200)
+        self.assertTrue(self.session.ledger.estimated)
+
+    def test_a_marketbuy_is_preferred_over_the_planned_price(self):
+        self.reach_to_sell()
+        self.session.on_journal({"event": "MarketBuy", "Type": "gold", "Count": 200,
+                                 "BuyPrice": 40000}, {})
+        self.dock_home()
+        self.sell(AvgPricePaid=None)
+        self.assertEqual(self.session.ledger.credits, 11_000_000 - 40000 * 200)
+
+    def test_a_sale_timestamped_before_the_session_started_is_ignored(self):
+        """EDMC replays the tail of the journal when it loads."""
+        self.reach_to_sell()
+        self.dock_home()
+        self.sell(minutes=-40)
+        self.assertEqual(self.session.ledger.sales, 0)
+
+    def test_a_sale_while_stopped_is_ignored(self):
+        self.session.stop()
+        self.sell()
+        self.assertEqual(self.session.ledger.sales, 0)
+
+    def test_no_session_line_before_the_first_sale(self):
+        self.reach_to_sell()
+        lines, _ = self.session.display_lines(now=self.now + timedelta(hours=1))
+        self.assertFalse([line for line in lines if line.startswith("Session:")], lines)
+
+    def session_line(self, now):
+        lines, role = self.session.display_lines(now=now)
+        found = [line for line in lines if line.startswith("Session:")]
+        self.assertEqual(len(found), 1, lines)
+        return found[0], lines, role
+
+    def test_the_session_line_appears_on_every_leg_after_the_first_sale(self):
+        """Docking home leaves the session SEARCHING, so TO_SELL is only reached
+        again on the next lap - which is a second leg worth driving properly."""
+        self.reach_to_sell()
+        effects = self.dock_home()
+        self.sell()
+        later = self.now + timedelta(minutes=72)
+
+        self.assertEqual(self.session.state, session_mod.SEARCHING)
+        line, _, role = self.session_line(later)
+        self.assertEqual(role, "buy")
+        self.assertTrue(line.startswith("Session: 1h12m - 1 run - "), line)
+
+        target = self.search_and_apply(effects)
+        self.assertEqual(self.session.state, session_mod.TO_BUY)
+        line, lines, role = self.session_line(later)
+        self.assertEqual(role, "buy")
+        # The paste instruction is the call to action and stays below it.
+        self.assertLess(lines.index(line),
+                        next(i for i, text in enumerate(lines) if "paste into" in text), lines)
+
+        self.dock_at_buy(target)
+        line, lines, role = self.session_line(later)
+        self.assertEqual(role, "sell")
+        self.assertLess(lines.index(line),
+                        next(i for i, text in enumerate(lines) if "paste into" in text), lines)
+
+    def test_a_second_lap_counts_a_second_run(self):
+        self.reach_to_sell()
+        effects = self.dock_home()
+        self.sell()
+        self.dock_at_buy(self.search_and_apply(effects))
+        self.dock_home()
+        self.sell(minutes=60)
+        self.assertEqual(self.session.ledger.runs, 2)
+        self.assertEqual(self.session.ledger.sales, 2)
+        self.assertEqual(self.session.ledger.tonnes, 400)
+
+    def test_stopping_reports_a_summary_and_resets(self):
+        self.reach_to_sell()
+        self.dock_home()
+        self.sell()
+        earned = self.session.ledger.credits
+        self.session.stop(now=self.now + timedelta(hours=2))
+        self.assertEqual(self.session.state, session_mod.OFF)
+        self.assertTrue(self.session.message.startswith("Session ended: "),
+                        self.session.message)
+        self.assertIn("2h00m", self.session.message)
+        self.assertIn("1 run", self.session.message)
+        self.assertEqual(self.session.ledger.credits, 0)
+        self.assertGreater(earned, 0)
+
+    def test_a_fresh_start_forgets_the_previous_session(self):
+        self.reach_to_sell()
+        self.dock_home()
+        self.sell()
+        self.session.start(self.session.params, now=self.now + timedelta(hours=3))
+        self.assertEqual(self.session.ledger.credits, 0)
+        self.assertEqual(self.session.ledger.runs, 0)
+        self.assertEqual(self.session.ledger.started_at, self.now + timedelta(hours=3))
+
+    def test_a_rejected_start_does_not_start_a_clock(self):
+        session = session_mod.Session()
+        validation, _ = session.start(session_mod.Params(sell_system="", commodity="Golde"),
+                                      now=self.now)
+        self.assertFalse(validation.ok)
+        self.assertIsNone(session.ledger.started_at)
+
+
 class FullCycle(unittest.TestCase):
     """Dock in the sell system, fly out, dock at the buy station, come back."""
 

@@ -38,6 +38,17 @@ def lookup_key(value: str) -> str:
     return _NON_ALNUM.sub("", text.casefold())
 
 
+def same_commodity(a: str, b: str) -> bool:
+    """Whether two spellings name the same commodity.
+
+    Market.json and the journal write '$gold_name;', Ardent writes 'gold', the
+    panel writes 'Gold'. The empty check is not redundant: without it two
+    unresolvable names both normalise to '' and would compare equal.
+    """
+    key = lookup_key(a)
+    return bool(key) and key == lookup_key(b)
+
+
 def edit_distance(a: str, b: str, limit: int) -> int:
     """Levenshtein distance, giving up once it exceeds `limit`.
 
@@ -191,6 +202,12 @@ def _self_test() -> None:
     assert edit_distance("abcdefgh", "zz", 2) == 3        # bailed out at the limit
 
     assert lookup_key("CMM Composite") == lookup_key("$cmmcomposite_name;")
+
+    assert same_commodity("$gold_name;", "gold")
+    assert same_commodity("Gold", "gold") and same_commodity("CMM Composite", "cmmcomposite")
+    assert not same_commodity("gold", "silver")
+    assert not same_commodity("", "") and not same_commodity("gold", "")
+
     print("edta_commodities self-test: OK ({} commodities)".format(len(tbl)))
 
 

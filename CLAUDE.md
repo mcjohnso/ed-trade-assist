@@ -69,6 +69,39 @@ Tk and EDMC interaction.
 minimum supply (both clause shapes return zero rows), it has no working recency filter (timestamp
 ranges are silently discarded), and it returns each station's entire market — ~100 KB per station.
 
+## The session ledger uses two clocks, deliberately
+
+`Ledger` (`edta_session.py`) accumulates realised profit for one Start-to-Stop session. Two different
+clocks are in play and they must not be merged:
+
+- **Bookkeeping uses the journal entry's own `timestamp`**, parsed with `core.parse_updated_at`. It is
+  used only to reject replays: EDMC re-reads the tail of the current journal when it loads, so a Start
+  pressed while that is draining would otherwise bank a sale from forty minutes ago. `REPLAY_SLACK`
+  is the tolerance.
+- **The elapsed display uses wall clock**, injected as `now`. It has to. The journal falls silent
+  while docked — that is why `_schedule_heartbeat` exists at all — so a journal-clocked stopwatch
+  would freeze exactly when the player is sitting looking at the number.
+
+They never meet in one subtraction: `started_at` comes from the button press, so elapsed is wall−wall,
+and the journal clock is only ever *compared* against it. `start()`, `stop()` and `display_lines()`
+all take `now=None` defaulting to `datetime.now(timezone.utc)`, the same seam as `rank_candidates` and
+`search_best`. `load.py` passes nothing and holds no clock of its own.
+
+**Profit is realised, never derived.** It comes from `MarketSell`, and the cost basis is the game's own
+`AvgPricePaid` — which handles a hold bought at several prices and correctly subtracts a cost incurred
+before the session started. Do not compute it from `Cargo` deltas times `sell_price`: that is exactly
+the estimate `_refresh_sell_price` refuses to make. Do not feed `MarketSell.SellPrice` back into
+`Session.sell_price` either; that field is documented as coming from Market.json and drives the
+*forecast* line, whereas a sale price is per-transaction and can reflect demand saturation.
+
+**The cost-basis fallback is seeded at the turnaround, and it has to be.** `_on_docked` sets
+`self.target = None` when you dock in the sell system, and docking strictly precedes selling — so a
+basis read from `self.target` inside `_on_market_sell` would always find `None`. The TO_SELL flip is
+the last moment it is alive. `MarketBuy` overrides it when seen.
+
+`ledger.runs` increments **only when `state == TO_SELL`** on docking home. Any other state means we
+were not carrying cargo back: the first Start, or a re-dock while still shopping.
+
 ## Ranking
 
 Order: age band, round-trip jumps, arrival-distance band (Ls), landing pad (bigger wins), price.
@@ -107,7 +140,7 @@ Two rules follow, both covered by tests in `Escalation`:
 
 ```bash
 python -m compileall -q .        # CI cannot import load.py
-python tests/test_core.py        # 59 tests, no EDMC, no network
+python tests/test_core.py        # 85 tests, no EDMC, no network
 python smoke_test.py             # stubs EDMC, drives a full cycle (needs a display)
 python tools/live_check.py Sol Gold --cargo 720 --laden 40   # hits the real API
 python package.py                # dist/EDTradeAssist-v<version>.zip

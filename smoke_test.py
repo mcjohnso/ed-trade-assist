@@ -227,6 +227,21 @@ def main() -> int:
     assert SENT[-1][1].startswith("SELL Gold @ Sol"), SENT[-1]
     print("docked at buy station -> clipboard flipped to Sol OK")
 
+    # Selling puts the realised session total on the overlay. This is the only
+    # check that the line survives redraw() all the way to an overlay send.
+    load.journal_entry("CMDR Test", False, target.system, target.station,
+                       {"event": "MarketBuy", "Type": "gold", "Count": 200,
+                        "BuyPrice": target.buy_price}, {})
+    load.journal_entry("CMDR Test", False, "Sol", "Abraham Lincoln",
+                       {"event": "MarketSell", "Type": "gold", "Count": 200,
+                        "SellPrice": target.buy_price + 5000,
+                        "TotalSale": (target.buy_price + 5000) * 200,
+                        "AvgPricePaid": target.buy_price}, {})
+    assert plugin.session.ledger.credits == 5000 * 200, plugin.session.ledger.credits
+    assert "Session: " in SENT[-1][1], SENT[-1]
+    print("sale booked -> overlay shows {!r} OK".format(
+        [l for l in SENT[-1][1].split("\n") if l.startswith("Session:")][0]))
+
     # Dock back in the sell system: the next search starts on its own.
     before = len(plugin.client.calls)
     load.journal_entry("CMDR Test", False, "Sol", "Abraham Lincoln",
@@ -249,7 +264,10 @@ def main() -> int:
 
     load._toggle_run()
     assert plugin.session.state == "off"
-    print("stop OK")
+    # The totals reach the panel through redraw()'s message fallback, which is
+    # the only route left once the overlay has been cleared.
+    assert "Session ended: " in plugin.detail_var.get(), plugin.detail_var.get()
+    print("stop OK -> {!r}".format(plugin.detail_var.get()))
 
     load.plugin_stop()
     print("plugin_stop OK")

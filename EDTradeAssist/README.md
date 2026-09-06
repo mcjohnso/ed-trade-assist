@@ -39,6 +39,34 @@ Press **Start**. From then on:
 Paste into the galaxy map search box each time. **Re-search** re-runs the current leg (ignoring the
 cache) if you want a different answer; **Copy system** puts the current target back on the clipboard.
 
+## What the session is earning
+
+Once you have sold something, a line appears showing what the session has actually made:
+
+```
+Session: 1h12m - 4 runs - 18.4M cr - 15.3M cr/hr
+```
+
+This is *realised* profit, taken from the game's own sale records — not the forecast on the line above
+it, which is the price gap times your hold size. Pressing **Stop** leaves the totals in the EDMC
+panel.
+
+Worth knowing what the number does and does not mean:
+
+- **Only the commodity you configured counts.** Selling incidental side cargo does not move it, so
+  the rate measures the route you set up rather than one lucky unrelated sale.
+- **The clock is wall time since Start.** A break, or an hour parked at a station, dilutes the rate —
+  it is a session average including all your dithering, not a throughput figure. Comparing two routes
+  with it is only fair if you flew both without interruption.
+- **A "run" is a completed round trip**: cargo carried home and docked. It counts arrivals, not
+  tonnes, so a partial fill still counts as one.
+- **`? cr/hr` for the first five minutes.** Extrapolating an hour from one sale forty seconds in gives
+  a number in the billions, so it waits until the figure means something.
+- **A `~` on the money** means one sale did not report what you paid for the cargo, and the price at
+  the buy station was used instead.
+- **Stop, and restarting EDMC, both reset it.** Your run parameters persist across a restart, so the
+  panel can look like the same session continuing when the totals have gone back to zero.
+
 ## How a buy location is chosen
 
 Hard requirements first — never a fleet carrier, at least 1.5× your hold in stock, a pad you can

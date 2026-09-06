@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import edta_commodities
@@ -252,6 +253,107 @@ def _is_freshest(candidate: core.Candidate, spec: core.SearchSpec) -> bool:
     return core.bucket_of(age_hours, spec.freshness_edges_h) == 0
 
 
+# --- the ledger --------------------------------------------------------------
+
+#: A sale stamped earlier than this before the session started is a replay, not
+#: a sale. EDMC re-reads the tail of the current journal when it loads, so
+#: pressing Start while that is still draining would otherwise bank an old sale
+#: as session profit. The slack absorbs journal write latency and clock skew.
+REPLAY_SLACK = timedelta(seconds=60)
+
+
+@dataclass
+class Ledger:
+    """What this session has actually earned, as opposed to what a run should be
+    worth. Reads no clock of its own: `now` is passed in, as everywhere in core.
+    """
+
+    started_at: Optional[datetime] = None
+    credits: int = 0
+    tonnes: int = 0
+    sales: int = 0
+    #: Completed round trips - cargo carried home and docked, not stops made.
+    runs: int = 0
+    #: Cost basis for a sale whose AvgPricePaid the journal left out. Set by a
+    #: MarketBuy, or seeded from the target at the turnaround - see _on_docked,
+    #: which clears self.target before any sale in the sell system can be seen.
+    buy_price_basis: Optional[int] = None
+    #: True once any sale had to fall back to that basis, so the display can
+    #: mark the figures as resting on an assumption.
+    estimated: bool = False
+
+    @property
+    def has_activity(self) -> bool:
+        return self.sales > 0
+
+    def elapsed_seconds(self, now: datetime) -> Optional[float]:
+        if self.started_at is None:
+            return None
+        # Clamped: a clock stepping backwards must not make the denominator
+        # negative and the rate a mirror image of itself.
+        return max(0.0, (now - self.started_at).total_seconds())
+
+    def per_hour(self, now: datetime) -> Optional[float]:
+        elapsed = self.elapsed_seconds(now)
+        if not elapsed:
+            return None
+        return self.credits * 3600.0 / elapsed
+
+    def is_replay(self, stamp: Optional[datetime]) -> bool:
+        if stamp is None or self.started_at is None:
+            return False
+        return stamp < self.started_at - REPLAY_SLACK
+
+    def record_buy(self, price: Optional[int]) -> None:
+        if price and price > 0:
+            self.buy_price_basis = int(price)
+
+    def record_sale(self, total_sale: int, count: int, avg_paid: Optional[float],
+                    no_cost_basis: bool = False) -> None:
+        """Book one sale. `avg_paid` is the game's own average price paid across
+        the hold, which is why it is preferred over anything we tracked: it
+        handles a hold bought at several prices, and it correctly subtracts a
+        cost incurred before the session started.
+        """
+        if avg_paid and float(avg_paid) > 0:
+            cost = int(round(float(avg_paid) * count))
+        elif no_cost_basis:
+            # Stolen or otherwise unpaid-for cargo has no cost. Subtracting a
+            # price that was never paid would print a loss that did not happen.
+            cost = 0
+        elif self.buy_price_basis:
+            cost = self.buy_price_basis * count
+            self.estimated = True
+        else:
+            cost = 0
+            self.estimated = True
+        self.credits += int(total_sale) - cost
+        self.tonnes += count
+        self.sales += 1
+
+    def lines(self, now: datetime) -> List[str]:
+        return core.session_lines(self.elapsed_seconds(now), self.runs,
+                                  self.credits, self.estimated)
+
+    def summary(self, now: datetime) -> str:
+        """One line for the EDMC panel once the run is over. Empty when nothing
+        was sold, which keeps a stopped-without-selling session as quiet as it
+        has always been."""
+        if not self.has_activity:
+            return ""
+        mark = "~" if self.estimated else ""
+        parts = ["Session ended: {}{} in {}".format(
+            mark, core.human_credits(self.credits),
+            core.human_duration(self.elapsed_seconds(now)))]
+        if self.runs:
+            parts.append("1 run" if self.runs == 1 else "{} runs".format(self.runs))
+        rate = self.per_hour(now)
+        elapsed = self.elapsed_seconds(now) or 0.0
+        if rate is not None and elapsed >= core.RATE_MIN_SECONDS:
+            parts.append(mark + core.human_credits(rate) + "/hr")
+        return " - ".join(parts)
+
+
 # --- the session -------------------------------------------------------------
 
 @dataclass
@@ -274,12 +376,15 @@ class Session:
     cargo: int = 0
     sell_price: Optional[int] = None
     note: str = ""
+    ledger: Ledger = field(default_factory=Ledger)
 
     # --- lifecycle ----------------------------------------------------------
 
-    def start(self, params: Params) -> Tuple[Validation, List[Effect]]:
+    def start(self, params: Params, now: Optional[datetime] = None
+              ) -> Tuple[Validation, List[Effect]]:
         result = validate(params)
         if not result.ok:
+            # A rejected Start must not start a clock: the run is not running.
             self.state = ERROR
             self.active = False
             self.message = " ".join(result.errors)
@@ -291,15 +396,21 @@ class Session:
         self.outcome = None
         self.note = ""
         self.sell_price = None
+        self.ledger = Ledger(started_at=now or datetime.now(timezone.utc))
         return result, self.begin_search()
 
-    def stop(self) -> List[Effect]:
+    def stop(self, now: Optional[datetime] = None) -> List[Effect]:
         self.state = OFF
         self.active = False
         self.target = None
         self.outcome = None
-        self.message = ""
+        # The totals go out through `message`: display_lines() is empty for OFF,
+        # and redraw() falls back to the message when there are no lines. The
+        # overlay is cleared by load.py immediately after, so this lands in the
+        # EDMC panel only - which is right, the run is over.
+        self.message = self.ledger.summary(now or datetime.now(timezone.utc))
         self.note = ""
+        self.ledger = Ledger()
         self.generation += 1          # abandon any search in flight
         return [Effect(REDRAW)]
 
@@ -374,6 +485,12 @@ class Session:
         if event == "Docked" or (event in ("Location", "CarrierJump") and entry.get("Docked")):
             return self._on_docked(entry)
 
+        if event == "MarketSell":
+            return self._on_market_sell(entry)
+
+        if event == "MarketBuy":
+            return self._on_market_buy(entry)
+
         if event in ("Undocked", "FSDJump", "SupercruiseEntry", "Cargo", "Loadout"):
             if event == "Undocked":
                 self.docked_at = ""
@@ -395,6 +512,48 @@ class Session:
         self.spec = dataclasses.replace(
             self.spec, sell_coords=(float(star_pos[0]), float(star_pos[1]), float(star_pos[2])))
 
+    # --- the money ----------------------------------------------------------
+
+    def _tracks(self, journal_type: Any) -> bool:
+        """Whether a market event is about the commodity this run is hauling.
+        The journal spells it '$gold_name;' where Ardent spells it 'gold', so
+        this cannot be a plain comparison."""
+        if self.spec is None:
+            return False
+        return edta_commodities.same_commodity(journal_type or "", self.spec.commodity_ardent)
+
+    def _on_market_buy(self, entry: Dict[str, Any]) -> List[Effect]:
+        """Remember what we paid, as the cost basis for a sale whose journal
+        entry omits AvgPricePaid. No redraw: buying changes nothing on screen."""
+        if not self._tracks(entry.get("Type")):
+            return []
+        count = int(entry.get("Count") or 0)
+        price = entry.get("BuyPrice")
+        if not price and count > 0 and entry.get("TotalCost"):
+            price = int(entry["TotalCost"]) // count
+        self.ledger.record_buy(price)
+        return []
+
+    def _on_market_sell(self, entry: Dict[str, Any]) -> List[Effect]:
+        """Book realised profit. This is the only place the plugin learns what
+        the run was actually worth; everything else is a forecast."""
+        if not self._tracks(entry.get("Type")):
+            return []
+        if self.ledger.is_replay(core.parse_updated_at(entry.get("timestamp"))):
+            return []
+        count = int(entry.get("Count") or 0)
+        if count <= 0:
+            return []
+        total = int(entry.get("TotalSale") or 0)
+        if total <= 0:
+            total = int(entry.get("SellPrice") or 0) * count
+        self.ledger.record_sale(
+            total, count, entry.get("AvgPricePaid"),
+            no_cost_basis=bool(entry.get("StolenGoods") or entry.get("IllegalGoods")))
+        # Redraw now rather than waiting up to a heartbeat: the number the player
+        # just earned should appear as they earn it.
+        return [Effect(REDRAW)]
+
     def _on_docked(self, entry: Dict[str, Any]) -> List[Effect]:
         system = (entry.get("StarSystem") or "").strip()
         station = (entry.get("StationName") or "").strip()
@@ -407,6 +566,11 @@ class Session:
 
         # Arrived at the sell system: this leg is done, plan the next one.
         if system.casefold() == self.spec.sell_system.casefold():
+            if self.state == TO_SELL:
+                # Only TO_SELL means "was carrying cargo home and has arrived".
+                # Docking here in any other state - the very first Start, a
+                # re-dock while still shopping - is not a completed round trip.
+                self.ledger.runs += 1
             self.note = ""
             self.target = None
             self.sell_price = None
@@ -418,6 +582,12 @@ class Session:
                            and int(market_id) == int(self.target.market_id))
             same_system = system.casefold() == self.target.system.casefold()
             if same_market or same_system:
+                # The last moment self.target is alive. By the time the sale
+                # happens we will have docked in the sell system, and the branch
+                # above has set self.target to None - so a cost basis read at
+                # sale time would always find nothing. Seed it here.
+                if self.ledger.buy_price_basis is None:
+                    self.ledger.buy_price_basis = self.target.buy_price
                 self.note = "" if same_market else (
                     "Docked at {} rather than {}.".format(station, self.target.station))
                 self.state = TO_SELL
@@ -438,15 +608,23 @@ class Session:
     def distance_home(self) -> float:
         return self.target.distance if self.target is not None else 0.0
 
-    def display_lines(self) -> Tuple[List[str], str]:
+    def display_lines(self, now: Optional[datetime] = None) -> Tuple[List[str], str]:
         """(lines, colour-role) for the overlay and the EDMC panel. Both render
-        the same content - the panel is the fallback when no overlay exists."""
+        the same content - the panel is the fallback when no overlay exists.
+
+        `now` is the elapsed-time clock, and it is deliberately the WALL clock
+        rather than the journal's: the journal falls silent while docked, which
+        is exactly when the player is sitting looking at these numbers.
+        """
+        now = now or datetime.now(timezone.utc)
         if self.state == OFF:
             return ([], "off")
         if self.spec is None:
             return (["Trade Assist: parameters incomplete"], "warn")
         if self.state == SEARCHING:
-            return (["Trade Assist: {}".format(self.message)], "buy")
+            # The search starts the instant you dock home having just sold, so
+            # this brief state is when the new rate is most worth seeing.
+            return (["Trade Assist: {}".format(self.message)] + self._session_lines(now), "buy")
         if self.state in (NO_RESULTS, ERROR):
             return (["Trade Assist: {}".format(self.message)], "warn")
 
@@ -454,6 +632,7 @@ class Session:
             lines = core.describe_candidate(self.target, self.spec)
             lines.extend(core.profit_lines(self.target.buy_price, self.sell_price,
                                            self.spec.cargo_capacity))
+            lines.extend(self._session_lines(now))
             lines.append("Copied \"{}\" - paste into the galaxy map".format(self.target.system))
             caveats = list(self.outcome.relaxed) if self.outcome else []
             if self.outcome and self.outcome.window_capped:
@@ -470,12 +649,20 @@ class Session:
             lines.extend(core.profit_lines(
                 self.target.buy_price if self.target else 0,
                 self.sell_price, self.spec.cargo_capacity))
+            lines.extend(self._session_lines(now))
             lines.append("Copied \"{}\" - paste into the galaxy map".format(self.spec.sell_system))
             if self.note:
                 lines.append(self.note)
             return (lines, "sell")
 
         return ([], "off")
+
+    def _session_lines(self, now: datetime) -> List[str]:
+        """The realised total, once there is one. Nothing has been earned before
+        the first sale, and a rate over no sales is not a number."""
+        if not self.ledger.has_activity:
+            return []
+        return self.ledger.lines(now)
 
     def status_line(self) -> str:
         labels = {
@@ -490,8 +677,6 @@ class Session:
 
 
 def _self_test() -> None:
-    from datetime import datetime, timedelta, timezone
-
     now = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
 
     def iso(when):
@@ -592,7 +777,7 @@ def _self_test() -> None:
 
     # --- a full cycle -------------------------------------------------------
     session = Session()
-    validation, effects = session.start(good)
+    validation, effects = session.start(good, now=now)
     assert validation.ok and session.state == SEARCHING
     assert [e.kind for e in effects] == [REDRAW, SEARCH]
     generation = effects[1].payload[0]
@@ -613,11 +798,34 @@ def _self_test() -> None:
     assert effects[0].kind == CLIPBOARD and effects[0].payload == "Sol"
     assert session.note == ""
 
-    # Docking back in the sell system starts the next search.
+    # Buying seeds a cost basis even before the sale reports one.
+    session.on_journal({"event": "MarketBuy", "Type": "gold", "Count": 720,
+                        "BuyPrice": 45595}, {})
+    assert session.ledger.buy_price_basis == 45595
+
+    # Docking back in the sell system starts the next search, and closes a run.
     effects = session.on_journal(
         {"event": "Docked", "StarSystem": "Sol", "StationName": "Abraham Lincoln",
          "MarketID": 128016384}, {"CargoCapacity": 720})
     assert session.state == SEARCHING and effects[-1].kind == SEARCH
+    assert session.ledger.runs == 1, session.ledger.runs
+
+    # Selling is the only place realised profit comes from.
+    session.on_journal({"event": "MarketSell", "timestamp": iso(now + timedelta(minutes=30)),
+                        "Type": "gold", "Count": 720, "SellPrice": 55000,
+                        "TotalSale": 39_600_000, "AvgPricePaid": 45595}, {})
+    assert session.ledger.sales == 1 and session.ledger.tonnes == 720
+    assert session.ledger.credits == 39_600_000 - 45595 * 720, session.ledger.credits
+    assert not session.ledger.estimated
+
+    # A sale of anything else on the same trip is not this route's income.
+    session.on_journal({"event": "MarketSell", "timestamp": iso(now + timedelta(minutes=31)),
+                        "Type": "silver", "Count": 12, "TotalSale": 300_000,
+                        "AvgPricePaid": 1000}, {})
+    assert session.ledger.sales == 1, session.ledger.sales
+
+    lines, _ = session.display_lines(now=now + timedelta(minutes=72))
+    assert any(line.startswith("Session: 1h12m - 1 run - ") for line in lines), lines
 
     # A different station in the buy system still advances, and says so.
     session.apply_outcome(effects[-1].payload[0], hit)
@@ -635,8 +843,19 @@ def _self_test() -> None:
     assert role == "sell" and any("paste into the galaxy map" in line for line in lines)
 
     assert session.clipboard_text() == "Sol"
-    session.stop()
+
+    # Stopping reports the totals once, then forgets them.
+    session.stop(now=now + timedelta(hours=2))
     assert session.state == OFF and session.display_lines() == ([], "off")
+    assert session.message.startswith("Session ended: "), session.message
+    assert "2h00m" in session.message and "/hr" in session.message, session.message
+    assert session.ledger.credits == 0 and session.ledger.runs == 0
+
+    # A session that sold nothing stays as quiet as it always has.
+    quiet = Session()
+    quiet.start(good, now=now)
+    quiet.stop(now=now + timedelta(minutes=5))
+    assert quiet.message == "", quiet.message
 
     print("edta_session self-test: OK")
 

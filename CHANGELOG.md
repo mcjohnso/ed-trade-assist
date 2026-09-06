@@ -3,6 +3,40 @@
 All notable changes to EDTradeAssist. Versions follow [SemVer](https://semver.org/);
 `__version__` in `EDTradeAssist/load.py` is authoritative and the git tag must match it.
 
+## [0.4.0] - 2026-09-05
+
+### Added
+- **Realised profit and a cr/hr rate for the session**, on the overlay and in the panel:
+
+  ```
+  Session: 1h12m - 4 runs - 18.4M cr - 15.3M cr/hr
+  ```
+
+  Until now the only profit shown was a forecast — the price gap times your hold size, which answers
+  "what should this run be worth" and never "what has this route actually paid me". The new line is
+  built from `MarketSell` journal events, so it is credits actually banked, and it appears once you
+  have sold something. Pressing **Stop** leaves the totals in the EDMC panel.
+
+  Only the commodity you configured counts; a `MarketSell` of incidental side cargo is ignored, so
+  the rate measures the route rather than one lucky unrelated sale. Cost comes from the game's own
+  `AvgPricePaid`, which handles a hold bought at several prices and correctly accounts for cargo
+  bought before you pressed Start. When the journal omits it, the price paid at the buy station is
+  used instead and both money figures are marked `~`.
+
+  The clock is **wall time since Start**, so a break or an hour parked at a station dilutes the rate.
+  That makes it a session average rather than a throughput figure — it is not a fair way to compare
+  two routes unless you flew both without interruption. Stop and Start resets it, and so does
+  restarting EDMC. The rate reads `? cr/hr` for the first five minutes, because extrapolating an hour
+  from one sale forty seconds in produces a number in the billions.
+
+  A "run" is a completed round trip: cargo carried home and docked. Docking in the sell system in any
+  other state — the first Start, or a re-dock while still shopping — does not count one.
+
+### Fixed
+- A `MarketSell` replayed from the journal tail when EDMC loads is no longer counted as session
+  profit. EDMC re-reads the end of the current journal on startup, so pressing Start while that was
+  still draining could bank a sale from forty minutes earlier.
+
 ## [0.3.0] - 2026-09-05
 
 ### Fixed
