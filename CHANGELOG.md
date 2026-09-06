@@ -3,7 +3,7 @@
 All notable changes to EDTradeAssist. Versions follow [SemVer](https://semver.org/);
 `__version__` in `EDTradeAssist/load.py` is authoritative and the git tag must match it.
 
-## [0.4.0] - 2026-09-05
+## [0.4.0] - 2026-09-06
 
 ### Added
 - **Realised profit and a cr/hr rate for the session**, on the overlay and in the panel:
