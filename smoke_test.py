@@ -115,6 +115,23 @@ with open(FIXTURE, "r", encoding="utf-8") as handle:
     ROWS = json.load(handle)
 
 
+def _restamp(rows):
+    """Slide every timestamp forward so the newest row is a minute old. The
+    plugin ages rows against the wall clock, so the capture's own dates would
+    fall outside the age limit a week after it was taken."""
+    from datetime import datetime, timedelta, timezone
+    import edta_core
+    stamps = [edta_core.parse_updated_at(row.get("updatedAt")) for row in rows]
+    shift = (datetime.now(timezone.utc) - timedelta(minutes=1)
+             - max(stamp for stamp in stamps if stamp))
+    for row, stamp in zip(rows, stamps):
+        if stamp:
+            row["updatedAt"] = (stamp + shift).isoformat().replace("+00:00", "Z")
+
+
+_restamp(ROWS)
+
+
 class FakeClient:
     """Serves the fixture instead of Ardent. Records every call so the smoke test
     can assert that carriers are never requested."""
@@ -126,6 +143,25 @@ class FakeClient:
                        max_days_ago=None, use_cache=True):
         self.calls.append((system, commodity, max_distance, min_volume, max_days_ago))
         return edta_ardent.SearchResult(edta_ardent.OK, rows=ROWS)
+
+    def clear_cache(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class FakeSpansh:
+    """The fallback source, kept offline. It finds nothing, so whatever the
+    fixture's age makes of Ardent, the Ardent result is the one under test."""
+
+    def __init__(self):
+        self.calls = []
+
+    def stations_selling(self, system, commodity_name, max_distance, min_volume,
+                         large_pad_only, updated_within_h, **kwargs):
+        self.calls.append((system, commodity_name, updated_within_h))
+        return edta_ardent.SearchResult(edta_ardent.OK, rows=[])
 
     def clear_cache(self):
         pass
@@ -163,6 +199,7 @@ def main() -> int:
 
     plugin = load.this
     plugin.client = FakeClient()
+    plugin.spansh = FakeSpansh()
 
     # The commander is sitting in Sol with a 200 t hold.
     load.journal_entry("CMDR Test", False, "Sol", "Abraham Lincoln",

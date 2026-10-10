@@ -6,6 +6,9 @@ still answers the shape we parse, and that the ranking picks something sensible.
 
     python tools/live_check.py Sol Gold --cargo 720 --laden 40
 
+By default it does what the plugin does, falling back to Spansh when Ardent is
+failing or stalled. --source ardent or --source spansh asks one of them alone.
+
 Add --raw to dump the top rows as they arrived, for comparing against
 ardent-insight.com or another tool.
 """
@@ -23,6 +26,7 @@ sys.path.insert(0, str(ROOT / "EDTradeAssist"))
 import edta_ardent                      # noqa: E402
 import edta_core as core                # noqa: E402
 import edta_session as session_mod      # noqa: E402
+import edta_spansh                      # noqa: E402
 
 
 def main() -> int:
@@ -36,6 +40,9 @@ def main() -> int:
     ap.add_argument("--jumps-per-leg", type=int, default=10)
     ap.add_argument("--max-age-days", type=int, default=7)
     ap.add_argument("--raw", action="store_true", help="dump the top rows verbatim")
+    ap.add_argument("--source", choices=("auto", "ardent", "spansh"), default="auto",
+                    help="auto is what the plugin does: Ardent, then Spansh if Ardent "
+                         "is failing or stalled")
     args = ap.parse_args()
 
     validation = session_mod.validate(session_mod.Params(
@@ -67,7 +74,25 @@ def main() -> int:
             ", window capped" if result.window_capped else ""))
         return result
 
-    outcome = session_mod.search_best(spec, fetch)
+    spansh = edta_spansh.SpanshClient(user_agent="EDTradeAssist-livecheck/0.1.0")
+
+    def fallback_fetch(updated_within_h):
+        result = spansh.stations_selling(
+            spec.sell_system, spec.commodity_display, spec.radius_ly, spec.min_volume,
+            large_pad_only=spec.min_pad >= 3, updated_within_h=updated_within_h)
+        seen["result"] = result
+        print("  spansh updated within {:g} h -> {} ({} rows)".format(
+            updated_within_h, result.kind, len(result.rows)))
+        return result
+
+    if args.source == "ardent":
+        outcome = session_mod.search_best(spec, fetch)
+    elif args.source == "spansh":
+        outcome = session_mod.search_spansh(spec, fallback_fetch)
+    else:
+        outcome = session_mod.search_with_fallback(spec, fetch, fallback_fetch)
+    print("source: {}; newest row seen {}".format(
+        outcome.source, core.human_age(outcome.newest_row_age_s)))
 
     if outcome.error_kind:
         print("upstream error [{}]: {}".format(outcome.error_kind, outcome.error_message))

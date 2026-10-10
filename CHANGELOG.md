@@ -3,6 +3,31 @@
 All notable changes to EDTradeAssist. Versions follow [SemVer](https://semver.org/);
 `__version__` in `EDTradeAssist/load.py` is authoritative and the git tag must match it.
 
+## [0.5.0] - 2026-10-10
+
+### Added
+- **Spansh as a fallback market source.** On 9 October 2026 Ardent stopped ingesting market updates
+  for more than a day. The plugin kept searching on every dock, but every result was 28 hours old —
+  it recommended a station for its 181,756 t of stock when the station actually held 596 t.
+
+  The plugin now asks [Spansh](https://spansh.co.uk) as well when Ardent returns an error, finds
+  nothing, or looks stalled (the newest row it returned, qualifying or not, is over six hours old).
+  Spansh's answer is used only when it ranks better under the same rules, and the panel says when
+  that happened:
+
+  ```
+  (Ardent data stale - using Spansh)
+  ```
+
+  If Spansh fails too, the Ardent result or error is shown exactly as before. Ardent remains the
+  primary source because Spansh returns each station's whole market (about 123 KB a station), so a
+  fallback search downloads several hundred kilobytes. Expect Spansh's data to be up to an hour
+  behind the game.
+
+### Fixed
+- `smoke_test.py` failed once its captured fixture was more than a week old, because the plugin ages
+  rows against the wall clock. The fixture's timestamps are now re-stamped at load.
+
 ## [0.4.0] - 2026-09-06
 
 ### Added

@@ -4,7 +4,8 @@ You fix a commodity and a sell system; the plugin picks the buy location for eac
 run, puts the system name you need on the clipboard at each leg, and shows the run
 on the in-game overlay. Dock, paste, fly, buy, paste, fly, sell, repeat.
 
-Market data comes from Ardent Insight (see edta_ardent.py). The ranking and the
+Market data comes from Ardent Insight (see edta_ardent.py), with Spansh as the
+fallback when Ardent is failing or stalled (edta_spansh.py). The ranking and the
 state machine are in edta_core.py / edta_session.py, both free of EDMC and tkinter
 so they can be tested on their own.
 """
@@ -29,8 +30,9 @@ import edta_core as core
 import edta_overlay
 import edta_session as session_mod
 import edta_settings
+import edta_spansh
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 plugin_version = __version__
 
 PLUGIN_NAME = "EDTradeAssist"
@@ -64,9 +66,11 @@ _TK_COLORS = {"buy": "#e08000", "sell": "#207a20", "warn": "#c00000", "off": Non
 class Plugin:
     def __init__(self) -> None:
         self.session = session_mod.Session()
-        self.client = edta_ardent.ArdentClient(
-            user_agent="{}/{} (+https://github.com/mcjohnso/ed-trade-assist)".format(
-                PLUGIN_NAME, __version__))
+        user_agent = "{}/{} (+https://github.com/mcjohnso/ed-trade-assist)".format(
+            PLUGIN_NAME, __version__)
+        self.client = edta_ardent.ArdentClient(user_agent=user_agent)
+        #: Asked only when Ardent is failing or stalled. See edta_spansh.py.
+        self.spansh = edta_spansh.SpanshClient(user_agent=user_agent)
         self.overlay = edta_overlay.OverlayManager()
         self.frame: Optional[tk.Frame] = None
         self.tasks: "queue.Queue" = queue.Queue()
@@ -107,7 +111,8 @@ class Plugin:
                 if task is None:
                     return
                 generation, spec = task
-                outcome = session_mod.search_best(spec, self._fetch_for(spec))
+                outcome = session_mod.search_with_fallback(
+                    spec, self._fetch_for(spec), self._fallback_fetch_for(spec))
                 self.results.put((generation, outcome))
                 self._wake_ui()
             except Exception:
@@ -120,6 +125,13 @@ class Plugin:
             return self.client.nearby_exports(
                 spec.sell_system, spec.commodity_ardent, radius, spec.min_volume,
                 max_days_ago=max_days)
+        return fetch
+
+    def _fallback_fetch_for(self, spec: core.SearchSpec):
+        def fetch(updated_within_h: float):
+            return self.spansh.stations_selling(
+                spec.sell_system, spec.commodity_display, spec.radius_ly, spec.min_volume,
+                large_pad_only=spec.min_pad >= 3, updated_within_h=updated_within_h)
         return fetch
 
     def _wake_ui(self) -> None:
@@ -284,6 +296,7 @@ def plugin_stop() -> None:
     if this.worker is not None and this.worker.is_alive():
         this.worker.join(timeout=5)
     this.client.close()
+    this.spansh.close()
 
 
 def plugin_app(parent):
@@ -435,6 +448,7 @@ def _toggle_run() -> None:
 def _research() -> None:
     if this.session.running:
         this.client.clear_cache()
+        this.spansh.clear_cache()
         this.perform(this.session.begin_search())
 
 

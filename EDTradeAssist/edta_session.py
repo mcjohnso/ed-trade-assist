@@ -167,6 +167,11 @@ class Outcome:
     window_capped: bool = False
     #: How far out the search actually had to look.
     searched_ly: float = 0.0
+    #: Which upstream the candidate came from.
+    source: str = "Ardent"
+    #: Age of the newest row the upstream returned, qualifying or not. None when
+    #: it returned no dated rows at all. This is how a stalled upstream shows.
+    newest_row_age_s: Optional[float] = None
 
     @property
     def ok(self) -> bool:
@@ -209,6 +214,7 @@ def search_best(spec: core.SearchSpec, fetch: Callable[[float, int], Any],
 
     Safe to call from a worker thread: it touches no session state.
     """
+    now = now or datetime.now(timezone.utc)
     outcome = Outcome()
     steps = escalation(spec)
     pool: Dict[Any, Dict[str, Any]] = {}
@@ -231,6 +237,7 @@ def search_best(spec: core.SearchSpec, fetch: Callable[[float, int], Any],
         outcome.attempts.append(Attempt(radius, max_days, len(result.rows), len(ranked)))
         outcome.window_capped = result.window_capped
         outcome.searched_ly = radius
+        outcome.newest_row_age_s = _newest_age(pool.values(), now)
 
         if ranked:
             outcome.candidate = ranked[0]
@@ -251,6 +258,101 @@ def _is_freshest(candidate: core.Candidate, spec: core.SearchSpec) -> bool:
     age_hours = (None if candidate.age_seconds is None
                  else candidate.age_seconds / 3600.0)
     return core.bucket_of(age_hours, spec.freshness_edges_h) == 0
+
+
+def _newest_age(rows: Any, now: datetime) -> Optional[float]:
+    stamps = [core.parse_updated_at(row.get("updatedAt")) for row in rows]
+    stamps = [stamp for stamp in stamps if stamp]
+    return (now - max(stamps)).total_seconds() if stamps else None
+
+
+# --- the fallback source -----------------------------------------------------
+
+#: When the newest row Ardent returned - qualifying or not - is older than this,
+#: Ardent is treated as stalled and Spansh is asked as well. In a populated
+#: region a healthy Ardent's newest row is minutes old. A sparse region can trip
+#: this honestly; the cost is one extra search and the better answer still wins.
+STALE_AFTER_H = 6.0
+
+
+def spansh_windows(spec: core.SearchSpec) -> List[float]:
+    """Recency windows to ask Spansh for, in hours, FRESHEST FIRST: one per
+    freshness band, ending at the oldest data the spec accepts."""
+    limit = spec.max_age_days * 24.0
+    return [edge for edge in spec.freshness_edges_h if edge < limit] + [limit]
+
+
+def search_spansh(spec: core.SearchSpec, fetch: Callable[[float], Any],
+                  now=None) -> Outcome:
+    """Search the fallback source. `fetch(updated_within_h)` returns the nearest
+    qualifying markets updated inside that window.
+
+    Spansh sorts by distance server-side, so there are no rings here. Instead the
+    RECENCY window widens a band at a time and the search stops at the first band
+    that holds a usable market - which keeps "age outranks jumps" exact while the
+    server hands back the nearest markets inside that band. An empty window costs
+    under 1 KB; only the one that hits pays for a full page.
+    """
+    now = now or datetime.now(timezone.utc)
+    outcome = Outcome(source="Spansh", searched_ly=spec.radius_ly)
+    for hours in spansh_windows(spec):
+        result = fetch(hours)
+        if result is None:
+            outcome.error_kind = "network"
+            outcome.error_message = "No response from Spansh."
+            return outcome
+        if not getattr(result, "ok", False):
+            outcome.error_kind = result.kind
+            outcome.error_message = result.message
+            return outcome
+
+        rows = list(result.rows or ())
+        ranked = core.rank_candidates(rows, spec, now=now)
+        outcome.attempts.append(Attempt(spec.radius_ly, spec.max_age_days, len(rows), len(ranked)))
+        if rows:
+            outcome.newest_row_age_s = _newest_age(rows, now)
+        if ranked:
+            outcome.candidate = ranked[0]
+            outcome.alternatives = ranked[1:6]
+            break
+    return outcome
+
+
+def fallback_reason(outcome: Outcome) -> str:
+    """Why the primary answer is not good enough to stand alone; '' when it is."""
+    if outcome.error_kind:
+        return "Ardent unavailable"
+    if not outcome.ok:
+        return "Ardent found nothing"
+    if (outcome.newest_row_age_s is None
+            or outcome.newest_row_age_s > STALE_AFTER_H * 3600.0):
+        return "Ardent data stale"
+    return ""
+
+
+def search_with_fallback(spec: core.SearchSpec, fetch: Callable[[float, int], Any],
+                         fallback_fetch: Optional[Callable[[float], Any]],
+                         now=None) -> Outcome:
+    """search_best() against Ardent, then Spansh if Ardent is failing or stalled.
+
+    Spansh's answer replaces Ardent's only when it ranks strictly better. If
+    Spansh fails or finds nothing, Ardent's outcome stands exactly as it was -
+    including its error, which is the one the player should read.
+    """
+    now = now or datetime.now(timezone.utc)
+    outcome = search_best(spec, fetch, now=now)
+    reason = fallback_reason(outcome)
+    if not reason or fallback_fetch is None:
+        return outcome
+
+    alternative = search_spansh(spec, fallback_fetch, now=now)
+    if not alternative.ok:
+        return outcome
+    if outcome.ok and (core.rank_key(outcome.candidate, spec)
+                       <= core.rank_key(alternative.candidate, spec)):
+        return outcome
+    alternative.relaxed.insert(0, "{} - using Spansh".format(reason))
+    return alternative
 
 
 # --- the ledger --------------------------------------------------------------

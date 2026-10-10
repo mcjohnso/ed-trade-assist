@@ -14,7 +14,8 @@ EDTradeAssist/            the plugin (this is what gets zipped)
   load.py                 EDMC callbacks, the panel, the worker thread
   edta_session.py         state machine + search escalation
   edta_core.py            pure: ranking, buckets, jump maths, formatting
-  edta_ardent.py          Ardent Insight client
+  edta_ardent.py          Ardent Insight client (primary source)
+  edta_spansh.py          Spansh client (fallback when Ardent is failing or stalled)
   edta_commodities.py     name resolution (+ generated edta_commodities.json)
   edta_overlay.py         EDMCOverlay / EDMCModernOverlay output
   edta_settings.py        preferences tab
@@ -53,6 +54,9 @@ tag must match it (`v1.2.0` ↔ `"1.2.0"`); `release.yml` builds and publishes t
 ## Data source
 
 [Ardent Insight](https://ardent-insight.com) — one GET per search returns supply, price, pad size,
-coordinates and a timestamp. Spansh is deliberately not used: its station search cannot combine a
-commodity with a minimum supply in one filter, it has no working recency filter, and it returns each
-station's entire market. See the notes at the top of `edta_ardent.py`.
+coordinates and a timestamp. See the notes at the top of `edta_ardent.py`.
+
+[Spansh](https://spansh.co.uk) is the fallback, asked only when Ardent errors, finds nothing, or has
+stopped ingesting (its newest returned row is over six hours old). It filters and sorts server-side
+but returns each station's entire market, about 123 KB a station, so it is not the primary source
+and its page size is kept at five. See the notes at the top of `edta_spansh.py`.

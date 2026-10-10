@@ -27,6 +27,7 @@ jobs:
           python EDTradeAssist/edta_core.py
           python EDTradeAssist/edta_commodities.py
           python EDTradeAssist/edta_ardent.py
+          python EDTradeAssist/edta_spansh.py
           python EDTradeAssist/edta_overlay.py
           python EDTradeAssist/edta_session.py
 

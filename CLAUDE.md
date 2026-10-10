@@ -20,7 +20,7 @@ bite you.
   `FrozenRuntimeImports` in `tests/test_core.py` enforces this automatically. C builtins (`math`,
   `time`, `itertools`) live in `python313.dll` rather than the zip, so they are exempt.
 - You cannot `pip install` into a user's EDMC. `requests` and `urllib3` *are* bundled;
-  `edta_ardent.py` imports requests lazily and falls back to `urllib` so the module still works (and
+  `edta_ardent.py` (and `edta_spansh.py`) imports requests lazily and falls back to `urllib` so the module still works (and
   stays testable) without it.
 - A partial `__pycache__` in the installed plugin folder is a useful diagnostic: the modules that
   compiled tell you how far the import chain got before it died.
@@ -65,9 +65,33 @@ Tk and EDMC interaction.
 - `maxLandingPadSize` is an int (1=S, 2=M, 3=L), unrelated to Spansh's `has_large_pad` boolean.
 - Rows with `commodityName: null` are settlements with no market.
 
-**Spansh is deliberately not used.** Its `marketplace` filter cannot combine a commodity with a
-minimum supply (both clause shapes return zero rows), it has no working recency filter (timestamp
-ranges are silently discarded), and it returns each station's entire market — ~100 KB per station.
+## Spansh is the fallback, not the primary
+
+`edta_spansh.py` is asked only by `search_with_fallback()` (`edta_session.py`), and only when Ardent
+errors, finds nothing, or looks stalled — the newest row it returned, **qualifying or not**, is older
+than `STALE_AFTER_H`. That last case is real: Ardent stopped ingesting for over a day on 2026-10-09
+and served 28-hour-old rows with a straight face. Spansh's candidate replaces Ardent's only when its
+`rank_key` is strictly better; if Spansh fails, Ardent's outcome (or error) stands untouched.
+
+An earlier version of this file said Spansh could not do the job. Re-tested live 2026-10-10:
+
+- Commodity plus minimum supply in one filter **works**:
+  `"market": [{"name": "Gold", "supply": {"value": [min, max], "comparison": "<=>"}}]`.
+- The `market_updated_at` range filter **is honoured**.
+- It sorts by distance server-side, so there are no rings on this path. `search_spansh()` widens the
+  *recency* window a freshness band at a time instead and stops at the first band with a usable
+  market, which keeps "age outranks jumps" exact.
+- It still returns each station's **entire market, ~123 KB a station**, and ignores `fields`. This is
+  why it is not the primary and why `PAGE_SIZE` is 5. An empty answer is under 1 KB, so the widening
+  is cheap until it hits.
+- Prices are player-side: `buy_price` is what you pay (checked against a journal `MarketBuy`). The
+  opposite convention from Ardent — `normalise_row()` maps them onto Ardent's row shape so
+  `edta_core` never knows the source.
+- Unknown system is a bare 400, the same as a malformed filter. Unknown commodity is `200` with no
+  rows. Commodities go by display name; all but three of ours (two rares and Limpets) match exactly.
+- Carriers are excluded with a station-type **allowlist** (the filter has no negation), so a station
+  type Frontier adds later is invisible to the fallback until it is added to `STATION_TYPES`.
+- Its data runs up to about an hour behind the game, so the one-hour band often comes back empty.
 
 ## The session ledger uses two clocks, deliberately
 
@@ -147,9 +171,10 @@ Two rules follow, both covered by tests in `Escalation`:
 
 ```bash
 python -m compileall -q .        # CI cannot import load.py
-python tests/test_core.py        # 85 tests, no EDMC, no network
+python tests/test_core.py        # 103 tests, no EDMC, no network
 python smoke_test.py             # stubs EDMC, drives a full cycle (needs a display)
 python tools/live_check.py Sol Gold --cargo 720 --laden 40   # hits the real API
+python tools/live_check.py Sol Gold --source spansh          # the fallback on its own
 python package.py                # dist/EDTradeAssist-v<version>.zip
 ```
 
@@ -181,3 +206,7 @@ Note that a search is now up to `MAX_RINGS + 1` requests rather than one, so a w
 (nothing qualifies anywhere) costs about six seconds and six requests. That is the price of not
 being lied to by the row cap, but it is the reason to keep `MAX_RINGS` small and to stop expanding
 as soon as something fresh turns up.
+
+The Spansh fallback adds up to one request per freshness band (six by default) on top of that, under
+the same one-a-second limit and 300 s cache, and only when Ardent is failing or stalled. Spansh's
+cost is bytes rather than requests: do not raise `PAGE_SIZE`.

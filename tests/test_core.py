@@ -24,6 +24,7 @@ import edta_commodities                 # noqa: E402
 import edta_core as core                # noqa: E402
 import edta_overlay                     # noqa: E402
 import edta_session as session_mod      # noqa: E402
+import edta_spansh                      # noqa: E402
 
 FIXTURE = ROOT / "tests" / "fixtures" / "ardent_gold_near_sol.json"
 
@@ -52,7 +53,8 @@ class SelfTests(unittest.TestCase):
     covers everything."""
 
     def test_module_self_tests(self):
-        for module in (core, edta_commodities, edta_ardent, edta_overlay, session_mod):
+        for module in (core, edta_commodities, edta_ardent, edta_spansh, edta_overlay,
+                       session_mod):
             with self.subTest(module=module.__name__):
                 module._self_test()
 
@@ -537,6 +539,209 @@ class Escalation(unittest.TestCase):
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.error_kind, edta_ardent.NOT_FOUND)
         self.assertEqual(len(outcome.attempts), 0)
+
+
+def spansh_station(**overrides):
+    """One station as Spansh's /api/stations/search returns it, trimmed."""
+    base = {
+        "name": "Thorn Constructions", "system_name": "HR 5518", "market_id": 4359005955,
+        "system_id64": 83986944778, "type": "Planetary Outpost",
+        "system_x": 84.15625, "system_y": 238.78125, "system_z": 266.625,
+        "distance": 55.1, "distance_to_arrival": 608.0,
+        "large_pads": 2, "medium_pads": 0, "small_pads": 4, "has_large_pad": True,
+        "market_updated_at": "2026-10-10T12:24:41Z",
+        "market": [
+            {"commodity": "Gold", "buy_price": 45000, "sell_price": 44000,
+             "supply": 5000, "demand": 1},
+            {"commodity": "Silver", "buy_price": 4000, "sell_price": 3900,
+             "supply": 9, "demand": 1},
+        ],
+    }
+    base.update(overrides)
+    return base
+
+
+class SpanshContract(unittest.TestCase):
+    def test_a_station_becomes_an_ardent_shaped_row(self):
+        row = edta_spansh.normalise_row(spansh_station(), "gold")
+        # Spansh prices are already player-side: buy_price is what you pay.
+        self.assertEqual(row["buyPrice"], 45000)
+        self.assertEqual(row["stock"], 5000)
+        self.assertEqual(row["maxLandingPadSize"], 3)
+        now = core.parse_updated_at("2026-10-10T13:00:00Z")
+        candidate = core.candidate_from_row(row, spec(), now=now)
+        self.assertEqual((candidate.station, candidate.system),
+                         ("Thorn Constructions", "HR 5518"))
+        self.assertEqual(candidate.market_id, 4359005955)
+        self.assertAlmostEqual(candidate.age_seconds, 35 * 60 + 19)
+        self.assertTrue(core.passes_filters(candidate, spec()))
+
+    def test_pad_size_comes_from_the_pad_counts(self):
+        medium = spansh_station(large_pads=0, medium_pads=3, has_large_pad=False)
+        small = spansh_station(large_pads=0, medium_pads=0, has_large_pad=False)
+        self.assertEqual(edta_spansh.normalise_row(medium, "Gold")["maxLandingPadSize"], 2)
+        self.assertEqual(edta_spansh.normalise_row(small, "Gold")["maxLandingPadSize"], 1)
+
+    def test_a_station_without_the_commodity_yields_no_row(self):
+        self.assertIsNone(edta_spansh.normalise_row(spansh_station(), "Palladium"))
+
+    def test_the_request_filters_and_sorts_server_side(self):
+        captured = {}
+
+        class Recorder(edta_spansh.SpanshClient):
+            def _request(self, body, commodity_name):
+                captured.update(body)
+                return edta_ardent.SearchResult(edta_ardent.OK, rows=[])
+
+        now = core.parse_updated_at("2026-10-10T13:00:00Z")
+        Recorder(user_agent="test").stations_selling("Sol", "Gold", 340, 1080, True, 6, now=now)
+        filters = captured["filters"]
+        self.assertEqual(captured["reference_system"], "Sol")
+        self.assertEqual(captured["sort"], [{"distance": {"direction": "asc"}}])
+        self.assertEqual(captured["size"], edta_spansh.PAGE_SIZE)
+        self.assertEqual(filters["market"][0]["name"], "Gold")
+        self.assertEqual(filters["market"][0]["supply"]["value"][0], 1080)
+        self.assertEqual(filters["distance"]["max"], 340)
+        self.assertEqual(filters["market_updated_at"]["value"][0], "2026-10-10T07:00:00Z")
+        self.assertEqual(filters["has_large_pad"], {"value": True})
+        # Carriers and construction depots are kept out by the type allowlist.
+        self.assertNotIn("Drake-Class Carrier", filters["type"]["value"])
+        self.assertFalse([t for t in filters["type"]["value"] if "Depot" in t])
+
+    def test_a_page_stays_small(self):
+        # Every station costs ~123 KB; a casual bump here is megabytes a search.
+        self.assertLessEqual(edta_spansh.PAGE_SIZE, 5)
+
+    def test_radius_is_refused_past_500_ly(self):
+        result = edta_spansh.SpanshClient(user_agent="test").stations_selling(
+            "Sol", "Gold", 501, 100, True, 1)
+        self.assertEqual(result.kind, edta_ardent.BAD_REQUEST)
+
+
+class Fallback(unittest.TestCase):
+    """Spansh is asked only when Ardent is failing or stalled, and its answer is
+    taken only when it ranks better."""
+
+    def setUp(self):
+        self.rows = load_fixture()
+        self.now = fixture_now(self.rows)
+        self.target = spec(min_pad=1)
+
+    def stamp(self, **ago):
+        return (self.now - timedelta(**ago)).isoformat().replace("+00:00", "Z")
+
+    def ardent_row(self, **overrides):
+        return {**self.rows[0], "stock": 999999, "maxLandingPadSize": 3, **overrides}
+
+    def spansh_row(self, **overrides):
+        row = edta_spansh.normalise_row(
+            spansh_station(market_updated_at=self.stamp(minutes=20)), "Gold")
+        row.update(overrides)
+        return row
+
+    def run_search(self, ardent, spansh):
+        self.spansh_calls = []
+
+        def fallback(hours):
+            self.spansh_calls.append(hours)
+            return spansh(hours)
+
+        return session_mod.search_with_fallback(self.target, ardent, fallback, now=self.now)
+
+    def ok(self, rows):
+        return edta_ardent.SearchResult(edta_ardent.OK, rows=rows)
+
+    def test_a_fresh_ardent_answer_never_touches_spansh(self):
+        outcome = self.run_search(lambda r, d: self.ok(self.rows),
+                                  lambda h: self.ok([self.spansh_row()]))
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.source, "Ardent")
+        self.assertEqual(self.spansh_calls, [])
+
+    def test_a_stalled_ardent_is_replaced_by_a_fresher_spansh_market(self):
+        # The October 2026 outage: every Ardent row frozen at the same hour.
+        stalled = [self.ardent_row(marketId=1, updatedAt=self.stamp(hours=28)),
+                   self.ardent_row(marketId=2, updatedAt=self.stamp(hours=29))]
+        outcome = self.run_search(lambda r, d: self.ok(stalled),
+                                  lambda h: self.ok([self.spansh_row()]))
+        self.assertEqual(outcome.source, "Spansh")
+        self.assertEqual(outcome.candidate.station, "Thorn Constructions")
+        self.assertIn("Ardent data stale - using Spansh", outcome.relaxed)
+
+    def test_one_fresh_unusable_row_proves_ardent_is_alive(self):
+        # Staleness is judged on every row returned, not just the qualifying
+        # ones: a just-updated market with no stock still shows Ardent ingesting.
+        rows = [self.ardent_row(marketId=1, updatedAt=self.stamp(hours=28)),
+                self.ardent_row(marketId=2, stock=0, updatedAt=self.stamp(minutes=5))]
+        outcome = self.run_search(lambda r, d: self.ok(rows),
+                                  lambda h: self.ok([self.spansh_row()]))
+        self.assertEqual(outcome.source, "Ardent")
+        self.assertEqual(self.spansh_calls, [])
+
+    def test_an_ardent_error_falls_back(self):
+        outcome = self.run_search(
+            lambda r, d: edta_ardent.SearchResult(edta_ardent.NETWORK, message="down"),
+            lambda h: self.ok([self.spansh_row()]))
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.source, "Spansh")
+        self.assertIn("Ardent unavailable - using Spansh", outcome.relaxed)
+
+    def test_an_empty_ardent_falls_back(self):
+        outcome = self.run_search(lambda r, d: self.ok([]),
+                                  lambda h: self.ok([self.spansh_row()]))
+        self.assertEqual(outcome.source, "Spansh")
+        self.assertIn("Ardent found nothing - using Spansh", outcome.relaxed)
+
+    def test_a_failing_spansh_leaves_the_ardent_outcome_alone(self):
+        stalled = [self.ardent_row(marketId=1, updatedAt=self.stamp(hours=28))]
+        outcome = self.run_search(
+            lambda r, d: self.ok(stalled),
+            lambda h: edta_ardent.SearchResult(edta_ardent.NETWORK, message="down"))
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.source, "Ardent")
+        self.assertFalse([note for note in outcome.relaxed if "Spansh" in note])
+
+    def test_both_failing_reports_the_ardent_error(self):
+        outcome = self.run_search(
+            lambda r, d: edta_ardent.SearchResult(edta_ardent.NOT_FOUND, message="no such system"),
+            lambda h: edta_ardent.SearchResult(edta_ardent.NOT_FOUND, message="spansh says no"))
+        self.assertEqual(outcome.error_message, "no such system")
+
+    def test_spansh_must_rank_better_to_win(self):
+        stalled = [self.ardent_row(marketId=1, updatedAt=self.stamp(hours=28))]
+        older = self.spansh_row(updatedAt=self.stamp(days=5))
+        outcome = self.run_search(lambda r, d: self.ok(stalled), lambda h: self.ok([older]))
+        self.assertEqual(outcome.source, "Ardent")
+
+    def test_the_recency_window_widens_a_band_at_a_time_and_stops_at_a_hit(self):
+        windows = session_mod.spansh_windows(self.target)
+        self.assertEqual(windows, [1.0, 6.0, 24.0, 72.0, 168.0])
+        hit = self.spansh_row(updatedAt=self.stamp(hours=10))
+        outcome = self.run_search(lambda r, d: self.ok([]),
+                                  lambda h: self.ok([hit] if h >= 24 else []))
+        self.assertTrue(outcome.ok)
+        self.assertEqual(self.spansh_calls, [1.0, 6.0, 24.0])
+
+    def test_windows_never_reach_past_the_oldest_acceptable_data(self):
+        self.assertEqual(session_mod.spansh_windows(spec(max_age_days=2)),
+                         [1.0, 6.0, 24.0, 48.0])
+
+    def test_rows_that_fail_the_local_filters_do_not_stop_the_widening(self):
+        # Spansh can only filter large pads server-side, so a window can come
+        # back non-empty and still hold nothing usable.
+        small = self.spansh_row(maxLandingPadSize=1)
+        good = self.spansh_row(marketId=7, stationName="Bigger",
+                               updatedAt=self.stamp(hours=3))
+        self.target = spec(min_pad=2)
+        outcome = self.run_search(lambda r, d: self.ok([]),
+                                  lambda h: self.ok([small] if h < 6 else [small, good]))
+        self.assertEqual(outcome.candidate.station, "Bigger")
+        self.assertEqual(self.spansh_calls, [1.0, 6.0])
+
+    def test_without_a_fallback_the_ardent_outcome_is_returned(self):
+        outcome = session_mod.search_with_fallback(
+            self.target, lambda r, d: self.ok([]), None, now=self.now)
+        self.assertFalse(outcome.ok)
 
 
 class SessionLedger(unittest.TestCase):

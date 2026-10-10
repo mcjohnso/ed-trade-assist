@@ -111,6 +111,11 @@ EDDN. Everything it reports was true when somebody last docked there and uploade
 next to each result is how much to trust it. Jump counts are estimates from straight-line distance
 and a 0.85 derate; no route is plotted.
 
+If Ardent is unreachable, finds nothing, or has stopped receiving updates (the newest thing it
+returns is more than six hours old), the plugin asks [Spansh](https://spansh.co.uk) as well and uses
+its answer when that is the better one. The panel says so: `(Ardent data stale - using Spansh)`.
+Spansh's own data usually runs up to an hour behind the game.
+
 ## Settings
 
 The prefs tab holds the knobs you set once: search radius in jumps per leg, supply headroom, maximum
