@@ -9,12 +9,21 @@ The ranking order implemented by rank_key() is, in priority order:
     2. landing pad     (hard filter: maxLandingPadSize >= requested)
     3. data freshness  (bucketed)
     4. round-trip jumps
-    5. distance to arrival (bucketed)
-    6. landing pad size, largest first
-    7. buy price       (final tiebreak)
+    5. orbital before surface
+    6. distance to arrival (bucketed)
+    7. list order      (several commodities only: more of the first-listed)
+    8. buy price       (final tiebreak)
+
+The landing pad is a filter and nothing more. A ship that fits a medium pad
+lands as easily on one as on a large, so a station offering a bigger pad than
+was asked for has not earned anything by it.
 
 Supply never ranks. Once a market holds enough to fill the hold, more of it is
 worth nothing - a market with 400,000 t is no better than one with 500 t.
+
+A run may list SEVERAL commodities. Supply is then the market's combined stock
+of everything listed, and a candidate is a market rather than a row: see
+candidates_from_rows(). The hold is filled in list order.
 
 Distance never ranks either: jumps are the cost that is actually paid, and two
 systems reachable in the same number of jumps are equally far away in the only
@@ -59,6 +68,15 @@ _INT_TO_PAD = {1: "S", 2: "M", 3: "L"}
 #: Station types excluded outright. Fleet carrier stock moves without warning and
 #: the carrier can jump away between the upload and your arrival.
 EXCLUDED_STATION_TYPES = frozenset({"fleetcarrier"})
+
+#: Station types that sit on a planet, in both upstreams' spellings (Ardent's
+#: first, then Spansh's), spaces removed and casefolded. Landing on one costs a
+#: glide and an approach that an orbital station does not. A type missing from
+#: here counts as orbital, so a new surface type is merely not penalised.
+SURFACE_STATION_TYPES = frozenset({
+    "craterport", "crateroutpost", "onfootsettlement", "surfacestation",
+    "planetaryport", "planetaryoutpost", "settlement", "surfacesettlement",
+})
 
 
 # --- small conversions -------------------------------------------------------
@@ -205,6 +223,7 @@ def thousands(value: Optional[float]) -> str:
 class SearchSpec:
     """Everything the ranking needs, resolved from the session parameters."""
 
+    #: The FIRST-listed commodity. The rest, if any, are in `also`.
     commodity_ardent: str
     commodity_display: str
     sell_system: str
@@ -218,6 +237,21 @@ class SearchSpec:
     freshness_edges_h: Tuple[float, ...] = FRESHNESS_EDGES_H
     ls_edges: Tuple[float, ...] = LS_EDGES
     sell_coords: Optional[Tuple[float, float, float]] = None
+    #: Further commodities as (ardent, display), in the order they were listed.
+    #: That order is the order the hold is filled in.
+    also: Tuple[Tuple[str, str], ...] = ()
+
+    @property
+    def commodities(self) -> Tuple[Tuple[str, str], ...]:
+        """Every listed commodity as (ardent, display), in list order."""
+        return ((self.commodity_ardent, self.commodity_display),) + tuple(self.also)
+
+    @property
+    def label(self) -> str:
+        """Short enough for a header line however long the list is."""
+        if not self.also:
+            return self.commodity_display
+        return "{} +{}".format(self.commodity_display, len(self.also))
 
     @property
     def min_volume(self) -> int:
@@ -273,9 +307,42 @@ def widen(radius: float) -> float:
 
 # --- candidates --------------------------------------------------------------
 
+@dataclass(frozen=True)
+class Lot:
+    """One listed commodity as one market stocks it."""
+
+    ardent: str
+    display: str
+    stock: int
+    buy_price: int
+
+
+def fill_plan(lots: Sequence[Lot], capacity: int) -> List[Tuple[Lot, int]]:
+    """(lot, tonnes) to load, taking the lots IN THE ORDER GIVEN until the hold
+    is full. The order is the player's own list - it is not re-sorted by price,
+    because cheap is not the same as profitable across different commodities and
+    the sell prices are not known when the search runs."""
+    plan: List[Tuple[Lot, int]] = []
+    remaining = max(0, int(capacity))
+    for lot in lots:
+        if remaining <= 0:
+            break
+        tonnes = min(lot.stock, remaining)
+        if tonnes > 0:
+            plan.append((lot, tonnes))
+            remaining -= tonnes
+    return plan
+
+
 @dataclass
 class Candidate:
-    """One ranked buy location, built from an Ardent /nearby/exports row."""
+    """One ranked buy location: a market, built from its Ardent /nearby/exports
+    rows - one row per listed commodity it stocks.
+
+    `stock` is the combined stock of every listed commodity and `buy_price` the
+    tonne-weighted price of `plan`; with one commodity those are simply the
+    row's own figures.
+    """
 
     system: str
     station: str
@@ -293,6 +360,10 @@ class Candidate:
     jumps_out: int = 0
     jumps_back: int = 0
     raw: Dict[str, Any] = field(default_factory=dict)
+    #: What this market stocks of the listed commodities, in list order.
+    lots: List[Lot] = field(default_factory=list)
+    #: (lot, tonnes) to load to fill the hold. See fill_plan().
+    plan: List[Tuple[Lot, int]] = field(default_factory=list)
 
     @property
     def jumps_total(self) -> int:
@@ -332,6 +403,10 @@ def candidate_from_row(row: Dict[str, Any], spec: SearchSpec,
         distance = float(row.get("distance") or 0.0)
 
     out, back = round_trip_jumps(distance, spec.unladen_range, spec.laden_range)
+    stock = int(row.get("stock") or 0)
+    buy_price = int(row.get("buyPrice") or 0)
+    ardent, display = spec.commodities[_listed_index(row, spec) or 0]
+    lot = Lot(ardent, display, stock, buy_price)
 
     return Candidate(
         system=system,
@@ -341,8 +416,8 @@ def candidate_from_row(row: Dict[str, Any], spec: SearchSpec,
         station_type=(row.get("stationType") or "").strip(),
         coords=coords,
         distance=distance,
-        stock=int(row.get("stock") or 0),
-        buy_price=int(row.get("buyPrice") or 0),
+        stock=stock,
+        buy_price=buy_price,
         pad=pad_to_int(row.get("maxLandingPadSize")),
         ls=_float_or_none(row.get("distanceToArrival")),
         updated_at=updated,
@@ -350,6 +425,84 @@ def candidate_from_row(row: Dict[str, Any], spec: SearchSpec,
         jumps_out=out,
         jumps_back=back,
         raw=row,
+        lots=[lot],
+        plan=fill_plan([lot], spec.cargo_capacity),
+    )
+
+
+def _name_key(value: Any) -> str:
+    return "".join(ch for ch in str(value or "").casefold() if ch.isalnum())
+
+
+def _listed_index(row: Dict[str, Any], spec: SearchSpec) -> Optional[int]:
+    """Which listed commodity a row is about. Ardent spells it 'gold' and the
+    Spansh rows carry the display name, so both spellings are tried.
+
+    With ONE commodity listed an unrecognised name still counts as it: the
+    request was for that commodity alone, so that is what came back.
+    """
+    key = _name_key(row.get("commodityName"))
+    for index, (ardent, display) in enumerate(spec.commodities):
+        if key in (_name_key(ardent), _name_key(display)):
+            return index
+    return 0 if not spec.also else None
+
+
+def candidates_from_rows(rows: Iterable[Dict[str, Any]], spec: SearchSpec,
+                         now: Optional[datetime] = None) -> List[Candidate]:
+    """One Candidate per MARKET, unranked and unfiltered.
+
+    A market that stocks three of the listed commodities arrives as three rows.
+    They are merged here so that supply can be judged on the combined stock -
+    no single commodity has to fill the hold on its own.
+    """
+    now = now or datetime.now(timezone.utc)
+    if not spec.also:
+        # One commodity: a row is a candidate, exactly as it always was.
+        singles = (candidate_from_row(row, spec, now=now) for row in rows or ())
+        return [candidate for candidate in singles if candidate is not None]
+
+    markets: Dict[Any, Dict[int, Candidate]] = {}
+    for row in rows or ():
+        candidate = candidate_from_row(row, spec, now=now)
+        if candidate is None:
+            continue
+        index = _listed_index(row, spec)
+        # A lot with nothing in it, or no price to buy it at, contributes
+        # nothing - and must not drag the market's age down with it either.
+        if index is None or candidate.stock <= 0 or candidate.buy_price <= 0:
+            continue
+        key = candidate.market_id or (candidate.system.casefold(),
+                                      candidate.station.casefold())
+        markets.setdefault(key, {})[index] = candidate
+    return [_merge_market(parts, spec) for parts in markets.values()]
+
+
+def _merge_market(parts: Dict[int, Candidate], spec: SearchSpec) -> Candidate:
+    ordered = [parts[index] for index in sorted(parts)]
+    head = ordered[0]
+    lots = [part.lots[0] for part in ordered]
+    plan = fill_plan(lots, spec.cargo_capacity)
+    tonnes = sum(count for _, count in plan)
+    price = (int(round(sum(lot.buy_price * count for lot, count in plan) / tonnes))
+             if tonnes else head.buy_price)
+    # The OLDEST reading speaks for the market. Ardent stamps every commodity of
+    # a market with the same upload time (checked live 2026-10-10: 820 of 820
+    # shared markets identical), so this only bites when something is off - and
+    # then an unknown or old reading must not pass as fresh.
+    if any(part.age_seconds is None for part in ordered):
+        updated, age = None, None
+    else:
+        oldest = max(ordered, key=lambda part: part.age_seconds)
+        updated, age = oldest.updated_at, oldest.age_seconds
+    return Candidate(
+        system=head.system, station=head.station, market_id=head.market_id,
+        system_address=head.system_address, station_type=head.station_type,
+        coords=head.coords, distance=head.distance,
+        stock=sum(lot.stock for lot in lots), buy_price=price,
+        pad=head.pad, ls=head.ls, updated_at=updated, age_seconds=age,
+        jumps_out=head.jumps_out, jumps_back=head.jumps_back, raw=head.raw,
+        lots=lots, plan=plan,
     )
 
 
@@ -371,6 +524,10 @@ def is_excluded_station(candidate: Candidate) -> bool:
     return candidate.station_type.replace(" ", "").casefold() in EXCLUDED_STATION_TYPES
 
 
+def is_surface(candidate: Candidate) -> bool:
+    return candidate.station_type.replace(" ", "").casefold() in SURFACE_STATION_TYPES
+
+
 def passes_filters(candidate: Candidate, spec: SearchSpec) -> bool:
     """Hard filters, in the stated priority order: carriers, supply, pad, age."""
     if is_excluded_station(candidate):
@@ -386,27 +543,41 @@ def passes_filters(candidate: Candidate, spec: SearchSpec) -> bool:
     return True
 
 
-def rank_key(candidate: Candidate, spec: SearchSpec) -> Tuple[int, int, int, int, int]:
+def rank_key(candidate: Candidate, spec: SearchSpec) -> Tuple[Any, ...]:
     """The lexicographic sort key. Lower is better at every position."""
     age_hours = None if candidate.age_seconds is None else candidate.age_seconds / 3600.0
     return (
         bucket_of(age_hours, spec.freshness_edges_h),   # 3. freshness
         candidate.jumps_total,                          # 4. round-trip jumps
-        bucket_of(candidate.ls, spec.ls_edges),         # 5. distance to arrival
-        -(candidate.pad or 0),                          # 6. bigger pad wins
-        candidate.buy_price,                            # 7. price paid
+        1 if is_surface(candidate) else 0,              # 5. orbital before surface
+        bucket_of(candidate.ls, spec.ls_edges),         # 6. distance to arrival
+        list_preference(candidate, spec),               # 7. more of what was listed first
+        candidate.buy_price,                            # 8. price paid
     )
+
+
+def list_preference(candidate: Candidate, spec: SearchSpec) -> Tuple[int, ...]:
+    """How far the planned hold leans towards the commodities listed FIRST:
+    minus the tonnes of each, in list order, so more of an earlier one sorts
+    ahead. Empty for a single commodity, where there is nothing to prefer.
+
+    This sits below every tier that costs time. A run is judged on how quickly
+    it can be flown, so the list only decides between markets that are equally
+    quick to use. It sits ABOVE price because the price of a mixed hold compares
+    unlike things - it would otherwise simply favour the cheapest commodity.
+    """
+    if not spec.also:
+        return ()
+    loaded = {lot.ardent: tonnes for lot, tonnes in candidate.plan}
+    return tuple(-loaded.get(ardent, 0) for ardent, _ in spec.commodities)
 
 
 def rank_candidates(rows: Iterable[Dict[str, Any]], spec: SearchSpec,
                     now: Optional[datetime] = None) -> List[Candidate]:
-    """Rows in, ranked candidates out. Rejected rows are simply absent."""
+    """Rows in, ranked candidates out. Rejected markets are simply absent."""
     now = now or datetime.now(timezone.utc)
-    kept = []
-    for row in rows or ():
-        candidate = candidate_from_row(row, spec, now=now)
-        if candidate is not None and passes_filters(candidate, spec):
-            kept.append(candidate)
+    kept = [candidate for candidate in candidates_from_rows(rows, spec, now=now)
+            if passes_filters(candidate, spec)]
     kept.sort(key=lambda c: rank_key(c, spec))
     return kept
 
@@ -417,23 +588,34 @@ def describe_candidate(candidate: Candidate, spec: SearchSpec) -> List[str]:
     """The full picture, as lines. Used by both the overlay and the EDMC panel -
     the panel is the fallback when no overlay is installed, so it must not be a
     shortened version of this."""
-    return [
-        "BUY {} @ {}".format(spec.commodity_display, candidate.station),
+    lines = [
+        "BUY {} @ {}".format(spec.label, candidate.station),
         "{} - {:.1f} ly - ~{}+{} jumps (est)".format(
             candidate.system, candidate.distance, candidate.jumps_out, candidate.jumps_back),
-        "{} t - {} cr/t - {}".format(
-            thousands(candidate.stock), thousands(candidate.buy_price),
-            human_age(candidate.age_seconds)),
-        "{} pad - {} - {}".format(
-            candidate.pad_label, candidate.station_type or "station", human_ls(candidate.ls)),
     ]
+    pad_line = "{} pad - {} - {}".format(
+        candidate.pad_label, candidate.station_type or "station", human_ls(candidate.ls))
+    if not spec.also:
+        lines.append("{} t - {} cr/t - {}".format(
+            thousands(candidate.stock), thousands(candidate.buy_price),
+            human_age(candidate.age_seconds)))
+        lines.append(pad_line)
+        return lines
+    # Several commodities: what to load, in the order to load it. The tonnage is
+    # the share of the hold, with the market's stock alongside so a short lot is
+    # visible before you fly there.
+    for lot, tonnes in candidate.plan:
+        lines.append("{} t {} - {} cr/t ({} t in stock)".format(
+            thousands(tonnes), lot.display, thousands(lot.buy_price), thousands(lot.stock)))
+    lines.append("{} - {}".format(pad_line, human_age(candidate.age_seconds)))
+    return lines
 
 
 def describe_return(spec: SearchSpec, distance: float,
                     cargo: Optional[int] = None) -> List[str]:
     laden = estimate_jumps(distance, spec.laden_range)
     lines = [
-        "SELL {} @ {}".format(spec.commodity_display, spec.sell_system),
+        "SELL {} @ {}".format(spec.label, spec.sell_system),
         "{:.1f} ly - ~{} jumps laden (est)".format(distance, laden),
     ]
     if cargo is not None:
@@ -449,6 +631,22 @@ def profit_lines(buy_price: int, sell_price: Optional[int],
         return []
     per_tonne = sell_price - buy_price
     return ["{:+,} cr/t - {:+,} cr/full hold".format(per_tonne, per_tonne * cargo_capacity)]
+
+
+def plan_profit_lines(plan: Sequence[Tuple[Lot, int]],
+                      sell_prices: Dict[str, int]) -> List[str]:
+    """profit_lines() for a mixed hold. Shown only when EVERY commodity in the
+    plan has a real sell price: a total with one leg guessed is a guess."""
+    tonnes = sum(count for _, count in plan)
+    if not tonnes:
+        return []
+    total = 0
+    for lot, count in plan:
+        sell = sell_prices.get(lot.ardent)
+        if not sell or sell <= 0:
+            return []
+        total += (sell - lot.buy_price) * count
+    return ["{:+,} cr/t avg - {:+,} cr/full hold".format(int(round(total / tonnes)), total)]
 
 
 #: Below this, extrapolating an hourly rate is fantasy - a full hold sold forty
@@ -541,22 +739,22 @@ def _self_test() -> None:
     far = row(stationName="Far", distance=300, distanceToArrival=10, buyPrice=1)
     assert order([far, near]) == ["Near", "Far"]
 
-    # Tier 5: same freshness and jumps -> closer arrival wins, price ignored.
+    # Tier 6: same freshness and jumps -> closer arrival wins, price ignored.
     close_ls = row(stationName="Close", distanceToArrival=50, buyPrice=99000)
     far_ls = row(stationName="FarLs", distanceToArrival=4000, buyPrice=1)
     assert order([far_ls, close_ls]) == ["Close", "FarLs"]
 
-    # Tier 6: all else equal, a bigger pad wins. Asking for M does not mean
-    # preferring M - an L pad station is strictly easier to use.
+    # The pad is a filter only. Asking for M means an M pad will do: a station
+    # with an L pad has not earned anything, so the cheaper one wins.
     med_spec = SearchSpec(commodity_ardent="gold", commodity_display="Gold",
                           sell_system="Sol", cargo_capacity=720, unladen_range=50.0,
                           laden_range=40.0, min_pad=2)
     med = row(stationName="Medium", maxLandingPadSize=2, buyPrice=40000)
     large = row(stationName="Large", maxLandingPadSize=3, buyPrice=45000)
-    assert [c.station for c in rank_candidates([med, large], med_spec, now=now)] == \
-        ["Large", "Medium"]
+    assert [c.station for c in rank_candidates([large, med], med_spec, now=now)] == \
+        ["Medium", "Large"]
 
-    # Tier 7: everything above equal -> cheapest wins. Proves price is reachable.
+    # Tier 8: everything above equal -> cheapest wins. Proves price is reachable.
     assert order([row(stationName="Dear", buyPrice=60000),
                   row(stationName="Cheap", buyPrice=40000)]) == ["Cheap", "Dear"]
 
@@ -624,6 +822,37 @@ def _self_test() -> None:
 
     lines = describe_candidate(rank_candidates([row()], spec, now=now)[0], spec)
     assert lines[0] == "BUY Gold @ Port" and "est" in lines[1]
+    assert lines[2] == "5,000 t - 45,000 cr/t - 10m ago", lines[2]
+
+    # Tier 5: orbital before surface, above arrival distance and price - in
+    # either upstream's spelling of a surface port.
+    assert order([row(stationName="Ground", stationType="CraterPort", buyPrice=1,
+                      distanceToArrival=10),
+                  row(stationName="Orbit", buyPrice=99000,
+                      distanceToArrival=4000)]) == ["Orbit", "Ground"]
+    assert order([row(stationName="Ground", stationType="Planetary Outpost", buyPrice=1),
+                  row(stationName="Orbit", buyPrice=99000)]) == ["Orbit", "Ground"]
+
+    # Several commodities: one market, judged on its combined stock.
+    multi = SearchSpec(commodity_ardent="gold", commodity_display="Gold",
+                       sell_system="Sol", cargo_capacity=720, unladen_range=50.0,
+                       laden_range=40.0, also=(("silver", "Silver"),))
+    assert multi.label == "Gold +1" and len(multi.commodities) == 2
+    pair = [row(marketId=1, commodityName="silver", stock=600, buyPrice=4000),
+            row(marketId=1, stock=500, buyPrice=45000)]
+    assert rank_candidates(pair[:1], multi, now=now) == []      # 600 t alone is short
+    both = rank_candidates(pair, multi, now=now)
+    assert len(both) == 1 and both[0].stock == 1100, both
+    # Gold was listed first, so it is loaded first whatever order the rows came in.
+    assert [(lot.display, t) for lot, t in both[0].plan] == [("Gold", 500), ("Silver", 220)]
+    assert both[0].buy_price == round((500 * 45000 + 220 * 4000) / 720), both[0].buy_price
+    lines = describe_candidate(both[0], multi)
+    assert lines[0] == "BUY Gold +1 @ Port", lines
+    assert lines[2] == "500 t Gold - 45,000 cr/t (500 t in stock)", lines
+    assert lines[3] == "220 t Silver - 4,000 cr/t (600 t in stock)", lines
+    assert plan_profit_lines(both[0].plan, {"gold": 50000}) == []
+    assert plan_profit_lines(both[0].plan, {"gold": 50000, "silver": 5000}) == [
+        "+3,778 cr/t avg - +2,720,000 cr/full hold"]
 
     print("edta_core self-test: OK")
 

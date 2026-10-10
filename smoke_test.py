@@ -320,6 +320,23 @@ def main() -> int:
     assert not drawn, "stopped session drew on the overlay: {}".format(drawn)
     print("stopped session draws nothing on the overlay OK")
 
+    # A list of commodities: one request each per ring, and neither is filtered
+    # on the full requirement, because the market qualifies on the combination.
+    before = len(plugin.client.calls)
+    plugin.vars["commodity"].set("Gold, Silver")
+    load._toggle_run()
+    assert pump(root, lambda: plugin.session.state == "to_buy"), (
+        "list search never completed; state={}".format(plugin.session.state))
+    asked = plugin.client.calls[before:]
+    assert [call[1] for call in asked[:2]] == ["gold", "silver"], asked
+    assert all(call[3] == 1 for call in asked), asked
+    assert SENT[-1][1].startswith("BUY Gold +1 @"), SENT[-1]
+    assert "Gold +1 to Sol" in plugin.status_var.get(), plugin.status_var.get()
+    print("commodity list -> {} requests, overlay shows {!r} OK".format(
+        len(asked), SENT[-1][1].split("\n")[0]))
+    load._toggle_run()
+    assert plugin.session.state == "off"
+
     load.plugin_stop()
     print("plugin_stop OK")
 

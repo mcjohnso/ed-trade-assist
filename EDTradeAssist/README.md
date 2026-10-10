@@ -1,7 +1,7 @@
 # EDTradeAssist
 
-An EDMC plugin for repetitive point-to-point hauling: you fix one commodity and one sell system,
-and the plugin picks the buy location for every run, puts the system name you need on the clipboard
+An EDMC plugin for repetitive point-to-point hauling: you fix a commodity (or a short list of them)
+and one sell system, and the plugin picks the buy location for every run, puts the system name you need on the clipboard
 at each leg, and shows the run on the in-game overlay.
 
 The loop is: **dock → paste → fly → buy → paste → fly → sell → repeat**, with no window switching.
@@ -27,7 +27,7 @@ Open **Setup** in the EDMC panel and fill in the run:
 | Field | Notes |
 |---|---|
 | Sell system | Where you sell. **Here** fills in your current system. |
-| Commodity | Any spelling — `Gold`, `gold`, `Consumer Technology`. A typo is rejected with suggestions. |
+| Commodities | Any spelling — `Gold`, `gold`, `Consumer Technology`. A typo is rejected with suggestions. Several, separated by commas, means "fill the hold with any mix of these" — see below. |
 | Cargo / pad | Hold size in tonnes, and the smallest pad your ship can use. **Ship** fills the hold from your loadout. |
 | Jump range | Unladen and laden, in ly. **Ship** fills unladen; laden is yours to enter — the journal never reports it. |
 
@@ -38,6 +38,36 @@ Press **Start**. From then on:
 
 Paste into the galaxy map search box each time. **Re-search** re-runs the current leg (ignoring the
 cache) if you want a different answer; **Copy system** puts the current target back on the clipboard.
+
+### Hauling a list of commodities
+
+Enter up to five, separated by commas:
+
+```
+Superconductors, Semiconductors, Computer Components
+```
+
+The plugin then looks for one market that can fill your hold with **any combination** of them. The
+supply requirement applies to what the market holds of all of them together, so three part-lots
+that add up are as good as one big one. Everything else about choosing the market is unchanged.
+
+**The order you type them in is the order to load them.** The first is taken as far as its stock
+goes, then the next tops up:
+
+```
+BUY Superconductors +2 @ Thorn Constructions
+HR 5518 - 55.1 ly - ~2+2 jumps (est)
+500 t Superconductors - 6,741 cr/t (596 t in stock)
+220 t Computer Components - 549 cr/t (125,320 t in stock)
+L pad - Planetary Outpost - 608 Ls - 12m ago
+```
+
+The order also breaks ties between markets, but only ties: how quickly the run can be flown always
+comes first. Between two markets that are equally quick to use, the one that can give you more of
+your first choice wins.
+
+A list costs one upstream request per commodity for each step of the search, which is why it is
+capped at five.
 
 ## What the session is earning
 
@@ -53,7 +83,7 @@ panel.
 
 Worth knowing what the number does and does not mean:
 
-- **Only the commodity you configured counts.** Selling incidental side cargo does not move it, so
+- **Only the commodities you configured count.** Selling incidental side cargo does not move it, so
   the rate measures the route you set up rather than one lucky unrelated sale.
 - **The clock is wall time since Start.** A break, or an hour parked at a station, dilutes the rate —
   it is a session average including all your dithering, not a throughput figure. Comparing two routes
@@ -69,14 +99,24 @@ Worth knowing what the number does and does not mean:
 
 ## How a buy location is chosen
 
-Hard requirements first — never a fleet carrier, at least 1.5× your hold in stock, a pad you can
-land on, and data no older than the age limit. What survives is then ranked:
+Hard requirements first — never a fleet carrier, at least 1.5× your hold in stock (of everything
+you listed, combined), a pad you can land on, and data no older than the age limit. What survives
+is then ranked:
 
 1. **Data age band** — 1 h, 6 h, 24 h, 3 d, 7 d
 2. **Round-trip jumps** — unladen out, laden back
-3. **Arrival-distance band** — 100, 500, 1000, 2500, 5000 Ls
-4. **Landing pad** — a bigger pad wins; asking for M does not mean preferring M
-5. **Price you pay** — cheapest, as the final tiebreak
+3. **Orbital before surface** — a station in space beats a port on a planet; surface ports are
+   ranked lower, never excluded
+4. **Arrival-distance band** — 100, 500, 1000, 2500, 5000 Ls
+5. **List order** — only when you listed several commodities: the market that fills more of the
+   hold with the ones you listed first
+6. **Price you pay** — cheapest, as the final tiebreak
+
+The first four are what a run costs in time, and they always come first: a quicker market offering
+only your last choice beats a slower one offering your first.
+
+**The landing pad never ranks.** It is a requirement and nothing more: set to M, a station with an
+M pad is exactly as good as one with an L.
 
 **Supply never ranks.** Once a market holds enough to fill your hold, more of it is worth nothing —
 400,000 t is no better than 500 t. It is a filter, not a score.

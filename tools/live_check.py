@@ -5,6 +5,10 @@ This is the check that the fixture-based tests cannot make: that the live API
 still answers the shape we parse, and that the ranking picks something sensible.
 
     python tools/live_check.py Sol Gold --cargo 720 --laden 40
+    python tools/live_check.py Sol "Superconductors, Semiconductors" --cargo 720
+
+A comma-separated list searches for a market that can fill the hold with any
+combination of them, exactly as the panel's Commodities field does.
 
 By default it does what the plugin does, falling back to Spansh when Ardent is
 failing or stalled. --source ardent or --source spansh asks one of them alone.
@@ -32,7 +36,7 @@ import edta_spansh                      # noqa: E402
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("sell_system")
-    ap.add_argument("commodity")
+    ap.add_argument("commodity", help="one commodity, or several separated by commas")
     ap.add_argument("--cargo", type=int, default=720)
     ap.add_argument("--unladen", type=float, default=50.0)
     ap.add_argument("--laden", type=float, default=40.0)
@@ -60,29 +64,37 @@ def main() -> int:
     spec = validation.spec
     client = edta_ardent.ArdentClient(user_agent="EDTradeAssist-livecheck/0.1.0")
     print("{} -> {} within {:.0f} ly, >= {:,} t, {} pad, <= {} days old".format(
-        spec.sell_system, spec.commodity_display, spec.radius_ly, spec.min_volume,
+        spec.sell_system, " + ".join(display for _, display in spec.commodities),
+        spec.radius_ly, spec.min_volume,
         core.pad_to_str(spec.min_pad), spec.max_age_days))
 
     seen = {}
+    # The same choice load.py makes: several commodities qualify on their
+    # combined stock, so no single one can be filtered on the full requirement.
+    min_volume = spec.min_volume if not spec.also else 1
 
-    def fetch(radius, max_days):
-        result = client.nearby_exports(spec.sell_system, spec.commodity_ardent,
-                                       radius, spec.min_volume, max_days_ago=max_days)
+    def fetch(commodity, radius, max_days):
+        result = client.nearby_exports(spec.sell_system, commodity,
+                                       radius, min_volume, max_days_ago=max_days)
         seen["result"] = result
-        print("  fetch radius={:.0f} max_days={} -> {} ({} rows{})".format(
-            radius, max_days, result.kind, len(result.rows),
+        print("  fetch {} radius={:.0f} max_days={} -> {} ({} rows{})".format(
+            commodity, radius, max_days, result.kind, len(result.rows),
             ", window capped" if result.window_capped else ""))
         return result
 
     spansh = edta_spansh.SpanshClient(user_agent="EDTradeAssist-livecheck/0.1.0")
 
-    def fallback_fetch(updated_within_h):
+    names = [display for _, display in spec.commodities]
+
+    def fallback_fetch(commodity_name, updated_within_h):
         result = spansh.stations_selling(
-            spec.sell_system, spec.commodity_display, spec.radius_ly, spec.min_volume,
-            large_pad_only=spec.min_pad >= 3, updated_within_h=updated_within_h)
+            spec.sell_system, commodity_name, spec.radius_ly,
+            session_mod.spansh_min_supply(spec),
+            large_pad_only=spec.min_pad >= 3, updated_within_h=updated_within_h,
+            also_names=names)
         seen["result"] = result
-        print("  spansh updated within {:g} h -> {} ({} rows)".format(
-            updated_within_h, result.kind, len(result.rows)))
+        print("  spansh {} updated within {:g} h -> {} ({} rows)".format(
+            commodity_name, updated_within_h, result.kind, len(result.rows)))
         return result
 
     if args.source == "ardent":

@@ -3,6 +3,34 @@
 All notable changes to EDTradeAssist. Versions follow [SemVer](https://semver.org/);
 `__version__` in `EDTradeAssist/load.py` is authoritative and the git tag must match it.
 
+## [0.6.0] - 2026-10-10
+
+### Added
+- **A list of commodities.** The Commodities field takes up to five, separated by commas. The plugin
+  then looks for one market that can fill the hold with any combination of them: the supply
+  requirement applies to the market's combined stock of everything listed. The hold is planned in
+  the order the list was typed, and the buy block shows what to load:
+
+  ```
+  500 t Superconductors - 6,741 cr/t (596 t in stock)
+  220 t Computer Components - 549 cr/t (125,320 t in stock)
+  ```
+
+  List order also breaks ties between markets that are equally quick to use - the one offering more
+  of your first choice wins - but never outranks jumps, orbital/surface or arrival distance.
+
+  Sales of every listed commodity count towards the session total, and the profit forecast appears
+  once the sell market has shown a price for each commodity in the planned hold. A single commodity
+  behaves exactly as before. A list costs one request per commodity for each step of the search.
+- **Orbital stations rank above surface ports.** A new ranking tier, after round-trip jumps and
+  before the arrival-distance band. Surface ports are ranked lower, not excluded.
+
+### Changed
+- **Landing pad size no longer ranks.** It is a requirement only: with the minimum set to M, a
+  station with an L pad no longer beats one with an M pad. This reverses the "bigger pad wins" tier.
+- Ranking order is now: age band → round-trip jumps → orbital before surface → arrival-distance
+  band → list order → price.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added

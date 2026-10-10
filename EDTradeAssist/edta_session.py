@@ -51,6 +51,8 @@ class Params:
     """Raw text from the panel, before validation."""
 
     sell_system: str = ""
+    #: One commodity, or several separated by commas. The order matters: it is
+    #: the order the hold is filled in.
     commodity: str = ""
     cargo_capacity: str = ""
     unladen_range: str = ""
@@ -90,6 +92,40 @@ def _positive_number(text: str, label: str, errors: List[str],
     return int(value) if integer else value
 
 
+#: How many commodities one run may list. Every one of them is a separate
+#: upstream request per ring, so this is a courtesy limit, not a technical one.
+MAX_COMMODITIES = 5
+
+
+def _resolve_commodities(text: str, errors: List[str],
+                         warnings: List[str]) -> List[edta_commodities.Commodity]:
+    """The comma-separated commodity field, in the order typed. Every entry is
+    checked, so one typo in a list of three is reported without hiding the rest."""
+    entries = [part.strip() for part in (text or "").split(",")]
+    entries = [entry for entry in entries if entry] or [""]
+    found: List[edta_commodities.Commodity] = []
+    for entry in entries:
+        resolution = edta_commodities.resolve(entry)
+        if not resolution.ok:
+            message = resolution.error
+            if resolution.suggestions:
+                message += " Did you mean: {}?".format(", ".join(resolution.suggestions))
+            errors.append(message)
+            continue
+        commodity = resolution.commodity
+        if commodity in found:
+            continue                    # listed twice, under whatever spelling
+        found.append(commodity)
+        if commodity.rare:
+            warnings.append(
+                "{} is a rare commodity - supply is allocation-limited and "
+                "usually far below a full hold.".format(commodity.name))
+    if len(found) > MAX_COMMODITIES:
+        errors.append("List at most {} commodities - each one is a separate "
+                      "search.".format(MAX_COMMODITIES))
+    return found
+
+
 def validate(params: Params) -> Validation:
     """Turn panel text into a SearchSpec, or into messages explaining why not."""
     errors: List[str] = []
@@ -99,19 +135,7 @@ def validate(params: Params) -> Validation:
     if not sell_system:
         errors.append("Sell system is required.")
 
-    commodity = None
-    resolution = edta_commodities.resolve(params.commodity)
-    if resolution.ok:
-        commodity = resolution.commodity
-        if commodity.rare:
-            warnings.append(
-                "{} is a rare commodity - supply is allocation-limited and "
-                "usually far below a full hold.".format(commodity.name))
-    else:
-        message = resolution.error
-        if resolution.suggestions:
-            message += " Did you mean: {}?".format(", ".join(resolution.suggestions))
-        errors.append(message)
+    commodities = _resolve_commodities(params.commodity, errors, warnings)
 
     capacity = _positive_number(params.cargo_capacity, "Cargo capacity", errors, integer=True)
     unladen = _positive_number(params.unladen_range, "Unladen jump range", errors)
@@ -128,8 +152,9 @@ def validate(params: Params) -> Validation:
         return Validation(False, errors=errors, warnings=warnings)
 
     spec = core.SearchSpec(
-        commodity_ardent=commodity.ardent,
-        commodity_display=commodity.name,
+        commodity_ardent=commodities[0].ardent,
+        commodity_display=commodities[0].name,
+        also=tuple((extra.ardent, extra.name) for extra in commodities[1:]),
         sell_system=sell_system,
         cargo_capacity=int(capacity),
         unladen_range=float(unladen),
@@ -178,7 +203,8 @@ class Outcome:
         return self.candidate is not None
 
 
-#: How many rings the search may fetch. Each is one upstream request.
+#: How many rings the search may fetch. Each is one upstream request PER LISTED
+#: COMMODITY.
 MAX_RINGS = 5
 
 
@@ -200,13 +226,18 @@ def _row_key(row: Dict[str, Any]) -> Any:
     return row.get("marketId") or (row.get("systemName"), row.get("stationName"))
 
 
-def search_best(spec: core.SearchSpec, fetch: Callable[[float, int], Any],
+def search_best(spec: core.SearchSpec, fetch: Callable[[str, float, int], Any],
                 now=None) -> Outcome:
     """Search outward until something recent qualifies.
 
-    Rows ACCUMULATE across rings, deduplicated by market. A wide ring may come
-    back truncated by the upstream row cap, but the near rings before it were
-    complete, so the nearest markets are always in the pool being ranked.
+    `fetch(commodity, radius, max_days)` is called once per listed commodity for
+    each ring: the upstream answers for one commodity at a time, and a market's
+    rows are merged afterwards so it can qualify on its combined stock.
+
+    Rows ACCUMULATE across rings, deduplicated by market and commodity. A wide
+    ring may come back truncated by the upstream row cap, but the near rings
+    before it were complete, so the nearest markets are always in the pool being
+    ranked.
 
     Expansion stops as soon as the best candidate so far is in the freshest age
     band. A merely acceptable near option does not stop the search, because age
@@ -221,21 +252,28 @@ def search_best(spec: core.SearchSpec, fetch: Callable[[float, int], Any],
     first_days = steps[0][1]
 
     for radius, max_days in steps:
-        result = fetch(radius, max_days)
-        if result is None:
-            outcome.error_kind = "network"
-            outcome.error_message = "No response from Ardent."
-            return outcome
-        if not getattr(result, "ok", False):
-            outcome.error_kind = result.kind
-            outcome.error_message = result.message
-            return outcome
+        fetched = 0
+        capped = False
+        for commodity, _ in spec.commodities:
+            result = fetch(commodity, radius, max_days)
+            if result is None:
+                outcome.error_kind = "network"
+                outcome.error_message = "No response from Ardent."
+                return outcome
+            if not getattr(result, "ok", False):
+                outcome.error_kind = result.kind
+                outcome.error_message = result.message
+                return outcome
+            for row in result.rows or ():
+                pool[(_row_key(row), commodity)] = row
+            fetched += len(result.rows or ())
+            # One truncated commodity is enough: its share of any market's
+            # combined stock can no longer be trusted to be complete out here.
+            capped = capped or bool(result.window_capped)
 
-        for row in result.rows or ():
-            pool[_row_key(row)] = row
         ranked = core.rank_candidates(list(pool.values()), spec, now=now)
-        outcome.attempts.append(Attempt(radius, max_days, len(result.rows), len(ranked)))
-        outcome.window_capped = result.window_capped
+        outcome.attempts.append(Attempt(radius, max_days, fetched, len(ranked)))
+        outcome.window_capped = capped
         outcome.searched_ly = radius
         outcome.newest_row_age_s = _newest_age(pool.values(), now)
 
@@ -246,7 +284,7 @@ def search_best(spec: core.SearchSpec, fetch: Callable[[float, int], Any],
                 outcome.relaxed.append("accepted data up to {} days old".format(max_days))
             if _is_freshest(ranked[0], spec):
                 break
-        if result.window_capped:
+        if capped:
             # Beyond here the upstream window is truncated and unsorted, so a
             # wider ring cannot be trusted to add anything better.
             break
@@ -282,10 +320,22 @@ def spansh_windows(spec: core.SearchSpec) -> List[float]:
     return [edge for edge in spec.freshness_edges_h if edge < limit] + [limit]
 
 
-def search_spansh(spec: core.SearchSpec, fetch: Callable[[float], Any],
+def spansh_min_supply(spec: core.SearchSpec) -> int:
+    """The supply to ask Spansh for when filtering on ONE of the listed
+    commodities. A market whose combined stock reaches min_volume across N
+    commodities must hold at least a 1/N share of it in one of them, so asking
+    each commodity for that share finds every market that qualifies - and
+    Spansh returns the whole market either way, so the total is then exact."""
+    count = len(spec.commodities)
+    return max(1, -(-spec.min_volume // count))
+
+
+def search_spansh(spec: core.SearchSpec, fetch: Callable[[str, float], Any],
                   now=None) -> Outcome:
-    """Search the fallback source. `fetch(updated_within_h)` returns the nearest
-    qualifying markets updated inside that window.
+    """Search the fallback source. `fetch(commodity_display, updated_within_h)`
+    returns the nearest markets stocking that commodity that were updated inside
+    that window, as rows for every listed commodity each of them has. It is
+    called once per listed commodity for each window.
 
     Spansh sorts by distance server-side, so there are no rings here. Instead the
     RECENCY window widens a band at a time and the search stops at the first band
@@ -296,17 +346,22 @@ def search_spansh(spec: core.SearchSpec, fetch: Callable[[float], Any],
     now = now or datetime.now(timezone.utc)
     outcome = Outcome(source="Spansh", searched_ly=spec.radius_ly)
     for hours in spansh_windows(spec):
-        result = fetch(hours)
-        if result is None:
-            outcome.error_kind = "network"
-            outcome.error_message = "No response from Spansh."
-            return outcome
-        if not getattr(result, "ok", False):
-            outcome.error_kind = result.kind
-            outcome.error_message = result.message
-            return outcome
+        merged: Dict[Any, Dict[str, Any]] = {}
+        for _, display in spec.commodities:
+            result = fetch(display, hours)
+            if result is None:
+                outcome.error_kind = "network"
+                outcome.error_message = "No response from Spansh."
+                return outcome
+            if not getattr(result, "ok", False):
+                outcome.error_kind = result.kind
+                outcome.error_message = result.message
+                return outcome
+            # The same market turns up under each commodity it stocks.
+            for row in result.rows or ():
+                merged[(_row_key(row), row.get("commodityName"))] = row
 
-        rows = list(result.rows or ())
+        rows = list(merged.values())
         ranked = core.rank_candidates(rows, spec, now=now)
         outcome.attempts.append(Attempt(spec.radius_ly, spec.max_age_days, len(rows), len(ranked)))
         if rows:
@@ -330,8 +385,8 @@ def fallback_reason(outcome: Outcome) -> str:
     return ""
 
 
-def search_with_fallback(spec: core.SearchSpec, fetch: Callable[[float, int], Any],
-                         fallback_fetch: Optional[Callable[[float], Any]],
+def search_with_fallback(spec: core.SearchSpec, fetch: Callable[[str, float, int], Any],
+                         fallback_fetch: Optional[Callable[[str, float], Any]],
                          now=None) -> Outcome:
     """search_best() against Ardent, then Spansh if Ardent is failing or stalled.
 
@@ -380,6 +435,9 @@ class Ledger:
     #: MarketBuy, or seeded from the target at the turnaround - see _on_docked,
     #: which clears self.target before any sale in the sell system can be seen.
     buy_price_basis: Optional[int] = None
+    #: The same, per commodity (keyed by edta_commodities.lookup_key), for a run
+    #: hauling several. Preferred over the single figure above when it has one.
+    basis_by_commodity: Dict[str, int] = field(default_factory=dict)
     #: True once any sale had to fall back to that basis, so the display can
     #: mark the figures as resting on an assumption.
     estimated: bool = False
@@ -406,12 +464,21 @@ class Ledger:
             return False
         return stamp < self.started_at - REPLAY_SLACK
 
-    def record_buy(self, price: Optional[int]) -> None:
+    def record_buy(self, price: Optional[int], commodity: str = "") -> None:
         if price and price > 0:
             self.buy_price_basis = int(price)
+            key = edta_commodities.lookup_key(commodity)
+            if key:
+                self.basis_by_commodity[key] = int(price)
+
+    def seed_basis(self, price: Optional[int], commodity: str) -> None:
+        """A planned price, used only until a real MarketBuy says otherwise."""
+        key = edta_commodities.lookup_key(commodity)
+        if key and price and price > 0:
+            self.basis_by_commodity.setdefault(key, int(price))
 
     def record_sale(self, total_sale: int, count: int, avg_paid: Optional[float],
-                    no_cost_basis: bool = False) -> None:
+                    no_cost_basis: bool = False, commodity: str = "") -> None:
         """Book one sale. `avg_paid` is the game's own average price paid across
         the hold, which is why it is preferred over anything we tracked: it
         handles a hold bought at several prices, and it correctly subtracts a
@@ -423,8 +490,8 @@ class Ledger:
             # Stolen or otherwise unpaid-for cargo has no cost. Subtracting a
             # price that was never paid would print a loss that did not happen.
             cost = 0
-        elif self.buy_price_basis:
-            cost = self.buy_price_basis * count
+        elif self._basis_for(commodity):
+            cost = self._basis_for(commodity) * count
             self.estimated = True
         else:
             cost = 0
@@ -432,6 +499,10 @@ class Ledger:
         self.credits += int(total_sale) - cost
         self.tonnes += count
         self.sales += 1
+
+    def _basis_for(self, commodity: str) -> Optional[int]:
+        key = edta_commodities.lookup_key(commodity)
+        return self.basis_by_commodity.get(key) or self.buy_price_basis
 
     def lines(self, now: datetime) -> List[str]:
         return core.session_lines(self.elapsed_seconds(now), self.runs,
@@ -476,7 +547,10 @@ class Session:
     current_system: str = ""
     docked_at: str = ""
     cargo: int = 0
-    sell_price: Optional[int] = None
+    #: Real sell prices in the sell system, by Ardent commodity name. From the
+    #: game's own Market.json and nowhere else; a commodity it does not list is
+    #: simply absent.
+    sell_prices: Dict[str, int] = field(default_factory=dict)
     note: str = ""
     ledger: Ledger = field(default_factory=Ledger)
 
@@ -497,7 +571,7 @@ class Session:
         self.target = None
         self.outcome = None
         self.note = ""
-        self.sell_price = None
+        self.sell_prices = {}
         self.ledger = Ledger(started_at=now or datetime.now(timezone.utc))
         return result, self.begin_search()
 
@@ -558,10 +632,15 @@ class Session:
             return "Nothing found."
         widest = max((a.radius for a in outcome.attempts), default=self.spec.radius_ly)
         widest = max(widest, outcome.searched_ly)
+        names = [display for _, display in self.spec.commodities]
+        if len(names) == 1:
+            wanted = names[0]
+        else:
+            wanted = "{} or {} combined".format(", ".join(names[:-1]), names[-1])
         return ("No market within {:.0f} ly of {} has {:,} t of {} on a {} pad. "
                 "Try a smaller hold, a smaller pad, or a different sell system.".format(
                     widest, self.spec.sell_system, self.spec.min_volume,
-                    self.spec.commodity_display, core.pad_to_str(self.spec.min_pad)))
+                    wanted, core.pad_to_str(self.spec.min_pad)))
 
     # --- journal ------------------------------------------------------------
 
@@ -619,12 +698,13 @@ class Session:
     # --- the money ----------------------------------------------------------
 
     def _tracks(self, journal_type: Any) -> bool:
-        """Whether a market event is about the commodity this run is hauling.
+        """Whether a market event is about a commodity this run is hauling.
         The journal spells it '$gold_name;' where Ardent spells it 'gold', so
         this cannot be a plain comparison."""
         if self.spec is None:
             return False
-        return edta_commodities.same_commodity(journal_type or "", self.spec.commodity_ardent)
+        return any(edta_commodities.same_commodity(journal_type or "", ardent)
+                   for ardent, _ in self.spec.commodities)
 
     def _on_market_buy(self, entry: Dict[str, Any]) -> List[Effect]:
         """Remember what we paid, as the cost basis for a sale whose journal
@@ -635,7 +715,7 @@ class Session:
         price = entry.get("BuyPrice")
         if not price and count > 0 and entry.get("TotalCost"):
             price = int(entry["TotalCost"]) // count
-        self.ledger.record_buy(price)
+        self.ledger.record_buy(price, entry.get("Type") or "")
         return []
 
     def _on_market_sell(self, entry: Dict[str, Any]) -> List[Effect]:
@@ -653,7 +733,8 @@ class Session:
             total = int(entry.get("SellPrice") or 0) * count
         self.ledger.record_sale(
             total, count, entry.get("AvgPricePaid"),
-            no_cost_basis=bool(entry.get("StolenGoods") or entry.get("IllegalGoods")))
+            no_cost_basis=bool(entry.get("StolenGoods") or entry.get("IllegalGoods")),
+            commodity=entry.get("Type") or "")
         # Redraw now rather than waiting up to a heartbeat: the number the player
         # just earned should appear as they earn it.
         return [Effect(REDRAW)]
@@ -677,7 +758,7 @@ class Session:
                 self.ledger.runs += 1
             self.note = ""
             self.target = None
-            self.sell_price = None
+            self.sell_prices = {}
             return self.begin_search()
 
         # Arrived at the buy location: turn around.
@@ -692,6 +773,8 @@ class Session:
                 # sale time would always find nothing. Seed it here.
                 if self.ledger.buy_price_basis is None:
                     self.ledger.buy_price_basis = self.target.buy_price
+                for lot in self.target.lots:
+                    self.ledger.seed_basis(lot.buy_price, lot.ardent)
                 self.note = "" if same_market else (
                     "Docked at {} rather than {}.".format(station, self.target.station))
                 self.state = TO_SELL
@@ -734,8 +817,7 @@ class Session:
 
         if self.state == TO_BUY and self.target is not None:
             lines = core.describe_candidate(self.target, self.spec)
-            lines.extend(core.profit_lines(self.target.buy_price, self.sell_price,
-                                           self.spec.cargo_capacity))
+            lines.extend(self._profit_lines())
             lines.extend(self._session_lines(now))
             lines.append("Copied \"{}\" - paste into the galaxy map".format(self.target.system))
             caveats = list(self.outcome.relaxed) if self.outcome else []
@@ -750,9 +832,7 @@ class Session:
 
         if self.state == TO_SELL:
             lines = core.describe_return(self.spec, self.distance_home(), self.cargo)
-            lines.extend(core.profit_lines(
-                self.target.buy_price if self.target else 0,
-                self.sell_price, self.spec.cargo_capacity))
+            lines.extend(self._profit_lines())
             lines.extend(self._session_lines(now))
             lines.append("Copied \"{}\" - paste into the galaxy map".format(self.spec.sell_system))
             if self.note:
@@ -760,6 +840,17 @@ class Session:
             return (lines, "sell")
 
         return ([], "off")
+
+    def _profit_lines(self) -> List[str]:
+        """The forecast for the planned hold, when the sell side is known."""
+        if self.spec is None:
+            return []
+        if self.spec.also:
+            return core.plan_profit_lines(self.target.plan if self.target else [],
+                                          self.sell_prices)
+        return core.profit_lines(self.target.buy_price if self.target else 0,
+                                 self.sell_prices.get(self.spec.commodity_ardent),
+                                 self.spec.cargo_capacity)
 
     def _session_lines(self, now: datetime) -> List[str]:
         """The realised total, once there is one. Nothing has been earned before
@@ -830,7 +921,7 @@ def _self_test() -> None:
     # A fresh hit in the first ring stops the search there - one request.
     calls = []
 
-    def near_hit(radius, days):
+    def near_hit(commodity, radius, days):
         calls.append(radius)
         return FakeResult([row()])
 
@@ -839,7 +930,7 @@ def _self_test() -> None:
     assert calls == [spec.first_ring_ly], calls
 
     # Nothing anywhere -> an outcome that is not an error, just empty.
-    empty = search_best(spec, lambda r, d: FakeResult([]), now=now)
+    empty = search_best(spec, lambda c, r, d: FakeResult([]), now=now)
     assert not empty.ok and not empty.error_kind and len(empty.attempts) == len(steps)
 
     # A near ring holding only STALE stock does not stop the search: age
@@ -849,7 +940,7 @@ def _self_test() -> None:
     fresh_row = row(stationName="FreshFar", distance=300)
     seen = []
 
-    def stale_then_fresh(radius, days):
+    def stale_then_fresh(commodity, radius, days):
         seen.append(radius)
         return FakeResult([stale_row] if len(seen) == 1 else [stale_row, fresh_row])
 
@@ -866,7 +957,7 @@ def _self_test() -> None:
                    updatedAt=iso(now - timedelta(days=3)), marketId=2)
     # The wide ring does NOT contain the near market - exactly how Ardent behaves
     # once its row cap bites.
-    merged = search_best(spec, lambda r, d: FakeResult(
+    merged = search_best(spec, lambda c, r, d: FakeResult(
         [near_only] if r == spec.first_ring_ly else [far_only],
         capped=r != spec.first_ring_ly), now=now)
     stations = [merged.candidate.station] + [c.station for c in merged.alternatives]
@@ -874,8 +965,29 @@ def _self_test() -> None:
     assert merged.candidate.station == "NearComplete", merged.candidate.station
     assert merged.window_capped is True
 
+    # A list of commodities is one request each per ring, and a market that
+    # holds enough of them BETWEEN them qualifies though neither lot would.
+    listed = validate(dataclasses.replace(good, commodity="Gold, silver, Gold"))
+    assert listed.ok and listed.spec.also == (("silver", "Silver"),), listed.spec
+    asked = []
+
+    def two_lots(commodity, radius, days):
+        asked.append(commodity)
+        stock = {"gold": 600, "silver": 500}[commodity]
+        return FakeResult([row(commodityName=commodity, stock=stock)])
+
+    mixed = search_best(listed.spec, two_lots, now=now)
+    assert asked == ["gold", "silver"], asked
+    assert mixed.ok and mixed.candidate.stock == 1100, mixed.candidate
+    assert [t for _, t in mixed.candidate.plan] == [600, 120], mixed.candidate.plan
+    assert spansh_min_supply(listed.spec) == 540 and spansh_min_supply(spec) == 1080
+    assert not validate(dataclasses.replace(
+        good, commodity="Gold, Silver, Palladium, Platinum, Tritium, Bauxite")).ok
+    one_bad = validate(dataclasses.replace(good, commodity="Gold, Silvr"))
+    assert not one_bad.ok and len(one_bad.errors) == 1, one_bad.errors
+
     # Upstream failure surfaces as an error, not as "nothing found".
-    failed = search_best(spec, lambda r, d: FakeResult([], "not_found", "no such system"),
+    failed = search_best(spec, lambda c, r, d: FakeResult([], "not_found", "no such system"),
                          now=now)
     assert not failed.ok and failed.error_kind == "not_found"
 

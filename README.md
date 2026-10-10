@@ -1,7 +1,7 @@
 # ed-trade-assist
 
 Source repo for **EDTradeAssist**, an [EDMC](https://github.com/EDCD/EDMarketConnector) plugin that
-runs the loop for targeted commodity hauling: one commodity, one sell system, and a freshly chosen
+runs the loop for targeted commodity hauling: one commodity or a short list, one sell system, and a freshly chosen
 buy location every run, with the system name you need on the clipboard at each leg.
 
 The shippable plugin is [`EDTradeAssist/`](EDTradeAssist/) — see

@@ -89,6 +89,11 @@ An earlier version of this file said Spansh could not do the job. Re-tested live
   `edta_core` never knows the source.
 - Unknown system is a bare 400, the same as a malformed filter. Unknown commodity is `200` with no
   rows. Commodities go by display name; all but three of ours (two rares and Limpets) match exactly.
+- A list of commodities is asked **one commodity per request** (`search_spansh` loops, the market
+  filter takes one). Each is filtered at `spansh_min_supply()` - the 1/N share of the requirement
+  that at least one commodity must reach - and `normalise_rows()` then reads every listed commodity
+  out of each station's market, so the combined total is exact. Discovery is not: a market that only
+  qualifies on the combination can sit outside every commodity's nearest five.
 - Carriers are excluded with a station-type **allowlist** (the filter has no negation), so a station
   type Frontier adds later is invisible to the fallback until it is added to `STATION_TYPES`.
 - Its data runs up to about an hour behind the game, so the one-hour band often comes back empty.
@@ -135,7 +140,20 @@ returns a `REDRAW` for every event while stopped, and each one would re-post the
 
 ## Ranking
 
-Order: age band, round-trip jumps, arrival-distance band (Ls), landing pad (bigger wins), price.
+Order: age band, round-trip jumps, orbital before surface, arrival-distance band (Ls), list order,
+price.
+
+**Round-trip time outranks margin.** That is the owner's stated priority (2026-10-10): the tiers
+that cost time - jumps, orbital/surface, arrival distance - come before anything about which
+commodity or what price. Do not move list order or price above them.
+
+**The landing pad is a filter and does not rank.** v0.3.0 made a bigger pad win; the owner reversed
+that on 2026-10-10: configured for M, an M pad is all that matters, and an L-pad station must not
+beat an M-pad one. Do not reintroduce it as "strictly easier to land on".
+
+Orbital-before-surface is a **rank, not a filter**, and it is decided by `SURFACE_STATION_TYPES` in
+`edta_core.py`, which holds both upstreams' spellings (`CraterPort` / `Planetary Port`). A type
+missing from it counts as orbital.
 
 **Supply and raw distance deliberately do not rank.** Supply only has to be enough - a market with
 400,000 t is not better than one with 500 t once both fill the hold. Distance is spent as jumps, so
@@ -149,6 +167,31 @@ still decide an outcome (`RankingPriorityOrder` in `tests/test_core.py`).
 Band values configured in Settings are carried through `Params` into the spec at `validate()` time.
 `save()` deletes a stored band that equals the code default, so tuning a default in a new release
 actually reaches users who have opened the Settings tab.
+
+## A list of commodities is one market, judged on its combined stock
+
+`SearchSpec.commodity_ardent` / `commodity_display` are the **first-listed** commodity and `also`
+holds the rest; read `spec.commodities` for all of them and `spec.label` for display. With `also`
+empty every code path is the single-commodity one it always was - same requests, same lines - and
+`MultiCommodity.test_a_single_commodity_run_is_described_exactly_as_before` pins that.
+
+- Upstream rows are per commodity, so `core.candidates_from_rows()` merges a market's rows into one
+  `Candidate` whose `stock` is the combined figure. That is all the supply filter needed.
+- **List order is fill order** (`core.fill_plan`), and it is deliberately not re-sorted by price:
+  cheap is not profitable across different commodities and sell prices are unknown at search time.
+- List order ranks markets **only as a tiebreak** (`core.list_preference`): below every tier that
+  costs time, above price. It is above price because `Candidate.buy_price` is the tonne-weighted
+  cost of the planned hold, which compares unlike things across commodities - without the list tier
+  the price tier simply picked whichever market sold the cheapest commodity listed (seen live: a
+  hold of Computer Components at 440 cr/t beating Superconductors, the first choice).
+- With several commodities Ardent is asked with `minVolume=1` (`load.py::_fetch_for`), because any
+  lot may be the one that tips a market over. Measured near Sol: under 3% of rows hold less than
+  100 t, so a per-commodity floor would not relieve the row cap anyway - and a floor would silently
+  under-count the total.
+- The pool in `search_best()` is keyed by market **and** commodity. Keyed by market alone, the
+  second commodity's row would overwrite the first.
+- The ledger keeps a cost basis per commodity (`basis_by_commodity`), seeded from `target.lots` at
+  the turnaround for the same reason the single one is.
 
 ## The search expands outward - do not "simplify" it back
 
@@ -171,10 +214,11 @@ Two rules follow, both covered by tests in `Escalation`:
 
 ```bash
 python -m compileall -q .        # CI cannot import load.py
-python tests/test_core.py        # 103 tests, no EDMC, no network
+python tests/test_core.py        # 153 tests, no EDMC, no network
 python smoke_test.py             # stubs EDMC, drives a full cycle (needs a display)
 python tools/live_check.py Sol Gold --cargo 720 --laden 40   # hits the real API
 python tools/live_check.py Sol Gold --source spansh          # the fallback on its own
+python tools/live_check.py Sol "Superconductors, Semiconductors" --cargo 720   # a list
 python package.py                # dist/EDTradeAssist-v<version>.zip
 ```
 
@@ -202,11 +246,14 @@ Ardent publishes no rate limit; absence of one is not permission. The client sel
 request a second and caches for 300 s, and a search only happens on docking or an explicit
 Re-search.
 
-Note that a search is now up to `MAX_RINGS + 1` requests rather than one, so a worst-case search
-(nothing qualifies anywhere) costs about six seconds and six requests. That is the price of not
+Note that a search is now up to `MAX_RINGS + 1` requests **per listed commodity** rather than one,
+so a worst-case single-commodity search (nothing qualifies anywhere) costs about six seconds and six
+requests, and a five-commodity list five times that. `MAX_COMMODITIES` exists for this reason. In
+the bubble a list usually stops at the third ring, where the row cap bites. That is the price of not
 being lied to by the row cap, but it is the reason to keep `MAX_RINGS` small and to stop expanding
 as soon as something fresh turns up.
 
-The Spansh fallback adds up to one request per freshness band (six by default) on top of that, under
+The Spansh fallback adds up to one request per commodity per freshness band (six bands by default)
+on top of that, under
 the same one-a-second limit and 300 s cache, and only when Ardent is failing or stalled. Spansh's
 cost is bytes rather than requests: do not raise `PAGE_SIZE`.

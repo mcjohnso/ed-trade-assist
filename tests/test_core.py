@@ -10,6 +10,7 @@ rot as the capture ages.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
 import unittest
@@ -307,25 +308,79 @@ class RankingPriorityOrder(unittest.TestCase):
                 self.row("Near", distance=20, distanceToArrival=9000, buyPrice=99000)),
             ["Near", "Far"])
 
-    def test_tier5_arrival_outranks_pad_and_price(self):
+    def test_arrival_outranks_price(self):
         self.assertEqual(
             self.order(
                 self.row("Deep", distanceToArrival=4000, buyPrice=1),
                 self.row("Shallow", distanceToArrival=50, buyPrice=99000)),
             ["Shallow", "Deep"])
 
-    def test_tier6_a_bigger_pad_wins(self):
-        # Asking for M does not mean preferring M: an L pad is strictly easier.
+    def test_the_pad_is_a_filter_and_never_ranks(self):
+        # Configured for M, an M pad is all that matters. A station that also
+        # has an L pad has earned nothing by it, so the tier below decides -
+        # here, the cheaper one.
         ranked = core.rank_candidates(
-            [self.row("Medium", maxLandingPadSize=2, buyPrice=40000),
-             self.row("Large", maxLandingPadSize=3, buyPrice=45000)],
+            [self.row("Large", maxLandingPadSize=3, buyPrice=45000),
+             self.row("Medium", maxLandingPadSize=2, buyPrice=40000)],
             spec(min_pad=2), now=self.now)
-        self.assertEqual([c.station for c in ranked], ["Large", "Medium"])
+        self.assertEqual([c.station for c in ranked], ["Medium", "Large"])
+        keys = {core.rank_key(c, spec(min_pad=2))[:-1] for c in ranked}
+        self.assertEqual(len(keys), 1, "pad size leaked into the ranking")
+
+    def test_a_pad_that_is_too_small_is_still_excluded(self):
+        ranked = core.rank_candidates(
+            [self.row("Small", maxLandingPadSize=1, buyPrice=1),
+             self.row("Medium", maxLandingPadSize=2)],
+            spec(min_pad=2), now=self.now)
+        self.assertEqual([c.station for c in ranked], ["Medium"])
 
     def test_tier7_price_is_reachable(self):
         self.assertEqual(
             self.order(self.row("Dear", buyPrice=60000), self.row("Cheap", buyPrice=40000)),
             ["Cheap", "Dear"])
+
+    def test_orbital_outranks_arrival_distance_and_price(self):
+        # A surface port costs a glide and an approach. With age and jumps
+        # level, the orbital station wins - even from much deeper in the system
+        # and against a far better price on the ground.
+        self.assertEqual(
+            self.order(self.row("GroundShallow", stationType="CraterPort",
+                                distanceToArrival=50, buyPrice=1),
+                       self.row("OrbitDeep", distanceToArrival=4000, buyPrice=99000)),
+            ["OrbitDeep", "GroundShallow"])
+
+    def test_orbital_does_not_outrank_jumps(self):
+        self.assertEqual(
+            self.order(self.row("OrbitFar", distance=300),
+                       self.row("GroundNear", stationType="CraterPort", distance=20)),
+            ["GroundNear", "OrbitFar"])
+
+    def test_arrival_distance_still_decides_between_two_orbital_stations(self):
+        # Moving it below orbital/surface must not leave it unreachable.
+        self.assertEqual(
+            self.order(self.row("Deep", distanceToArrival=4000, buyPrice=1),
+                       self.row("Shallow", distanceToArrival=50, buyPrice=99000)),
+            ["Shallow", "Deep"])
+
+    def test_surface_is_recognised_in_both_upstreams_spellings(self):
+        for station_type in ("CraterPort", "CraterOutpost", "OnFootSettlement",
+                             "Planetary Port", "Planetary Outpost", "Surface Settlement"):
+            with self.subTest(station_type=station_type):
+                self.assertEqual(
+                    self.order(self.row("Ground", stationType=station_type, buyPrice=1),
+                               self.row("Orbit", buyPrice=99000)),
+                    ["Orbit", "Ground"])
+
+    def test_two_surface_ports_still_fall_through_to_price(self):
+        # The tier must not swallow the ones below it.
+        self.assertEqual(
+            self.order(self.row("DearGround", stationType="CraterPort", buyPrice=60000),
+                       self.row("CheapGround", stationType="CraterPort", buyPrice=40000)),
+            ["CheapGround", "DearGround"])
+
+    def test_surface_ports_are_ranked_lower_not_removed(self):
+        self.assertEqual(self.order(self.row("OnlyGround", stationType="CraterPort")),
+                         ["OnlyGround"])
 
     def test_supply_is_a_filter_never_a_ranking(self):
         # 400x the stock is worth nothing once both can fill the hold.
@@ -368,6 +423,296 @@ class RankingPriorityOrder(unittest.TestCase):
             self.order(self.row("NearerDearer", distanceToArrival=50, buyPrice=60000),
                        self.row("FartherCheaper", distanceToArrival=90, buyPrice=40000)),
             ["FartherCheaper", "NearerDearer"])
+
+
+class MultiCommodity(unittest.TestCase):
+    """A run may list several commodities. A market is then judged on what it
+    holds of all of them together, and the hold is filled in list order."""
+
+    def setUp(self):
+        self.now = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
+        self.spec = spec(commodity_ardent="superconductors",
+                         commodity_display="Superconductors",
+                         also=(("semiconductors", "Semiconductors"),
+                               ("computercomponents", "Computer Components")))
+
+    def iso(self, **delta):
+        return (self.now - timedelta(**delta)).isoformat().replace("+00:00", "Z")
+
+    def row(self, commodity, stock, market=1, **kw):
+        base = {
+            "commodityName": commodity, "systemName": "Sys {}".format(market),
+            "stationName": "Port {}".format(market), "marketId": market,
+            "stationType": "Coriolis", "maxLandingPadSize": 3, "stock": stock,
+            "buyPrice": 1000, "distance": 20, "distanceToArrival": 200,
+            "updatedAt": self.iso(minutes=10),
+        }
+        base.update(kw)
+        return base
+
+    def rank(self, *rows):
+        return core.rank_candidates(rows, self.spec, now=self.now)
+
+    def test_the_spec_keeps_the_list_in_order(self):
+        self.assertEqual([display for _, display in self.spec.commodities],
+                         ["Superconductors", "Semiconductors", "Computer Components"])
+        self.assertEqual(self.spec.label, "Superconductors +2")
+        self.assertEqual(spec().label, "Gold")
+
+    def test_combined_stock_qualifies_where_no_single_lot_does(self):
+        # 1,080 t needed; no one lot reaches it, the three together do.
+        ranked = self.rank(self.row("superconductors", 400),
+                           self.row("semiconductors", 400),
+                           self.row("computercomponents", 400))
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(ranked[0].stock, 1200)
+        self.assertEqual(len(ranked[0].lots), 3)
+
+    def test_a_market_short_on_the_combined_total_is_rejected(self):
+        self.assertEqual(self.rank(self.row("superconductors", 500),
+                                   self.row("semiconductors", 500)), [])
+
+    def test_one_commodity_alone_can_still_fill_the_hold(self):
+        ranked = self.rank(self.row("semiconductors", 5000))
+        self.assertEqual([lot.display for lot in ranked[0].lots], ["Semiconductors"])
+        self.assertEqual(ranked[0].plan[0][1], 720)
+
+    def test_stock_is_never_pooled_across_different_markets(self):
+        self.assertEqual(self.rank(self.row("superconductors", 600, market=1),
+                                   self.row("semiconductors", 600, market=2)), [])
+
+    def test_the_hold_is_filled_in_list_order_not_arrival_or_price_order(self):
+        ranked = self.rank(self.row("computercomponents", 5000, buyPrice=500),
+                           self.row("semiconductors", 300, buyPrice=900),
+                           self.row("superconductors", 200, buyPrice=6000))
+        self.assertEqual([(lot.display, tonnes) for lot, tonnes in ranked[0].plan],
+                         [("Superconductors", 200), ("Semiconductors", 300),
+                          ("Computer Components", 220)])
+
+    def test_the_price_of_a_mixed_hold_is_the_cost_of_the_plan(self):
+        ranked = self.rank(self.row("superconductors", 360, buyPrice=6000),
+                           self.row("semiconductors", 5000, buyPrice=1000))
+        self.assertEqual(ranked[0].buy_price, 3500)       # half the hold at each price
+
+    def test_all_else_equal_the_first_listed_commodity_wins_over_a_cheaper_one(self):
+        # Without this tier the price tiebreak would simply pick whichever
+        # market sells the cheapest commodity on the list.
+        self.assertEqual([c.station for c in self.rank(
+            self.row("computercomponents", 5000, market=1, buyPrice=440),
+            self.row("superconductors", 5000, market=2, buyPrice=6000))],
+            ["Port 2", "Port 1"])
+
+    def test_more_of_the_first_listed_commodity_wins(self):
+        self.assertEqual([c.station for c in self.rank(
+            self.row("superconductors", 200, market=1),
+            self.row("semiconductors", 5000, market=1),
+            self.row("superconductors", 600, market=2),
+            self.row("semiconductors", 5000, market=2))], ["Port 2", "Port 1"])
+
+    def test_list_order_never_outranks_anything_that_costs_time(self):
+        # Each loser here is the first-listed commodity; each winner is the
+        # last-listed one at a market that is quicker to use.
+        first = dict(market=1)
+        last = dict(market=2)
+        for label, slower, quicker in (
+                ("jumps", dict(distance=300), dict(distance=20)),
+                ("arrival", dict(distanceToArrival=4000), dict(distanceToArrival=50)),
+                ("surface", dict(stationType="CraterPort"), dict(stationType="Coriolis"))):
+            with self.subTest(tier=label):
+                ranked = self.rank(self.row("superconductors", 5000, **first, **slower),
+                                   self.row("computercomponents", 5000, **last, **quicker))
+                self.assertEqual([c.station for c in ranked], ["Port 2", "Port 1"])
+
+    def test_list_order_decides_before_a_bigger_pad_could(self):
+        # The pad does not rank at all, so the first-listed commodity on an M
+        # pad beats the last-listed one on an L.
+        ranked = core.rank_candidates(
+            [self.row("computercomponents", 5000, market=1, maxLandingPadSize=3),
+             self.row("superconductors", 5000, market=2, maxLandingPadSize=2)],
+            dataclasses.replace(self.spec, min_pad=2), now=self.now)
+        self.assertEqual([c.station for c in ranked], ["Port 2", "Port 1"])
+
+    def test_price_still_decides_between_identical_plans(self):
+        self.assertEqual([c.station for c in self.rank(
+            self.row("superconductors", 5000, market=1, buyPrice=6000),
+            self.row("superconductors", 5000, market=2, buyPrice=5000))],
+            ["Port 2", "Port 1"])
+
+    def test_a_single_commodity_has_no_list_tier(self):
+        single = spec()
+        candidate = core.rank_candidates(
+            [self.row("gold", 5000)], single, now=self.now)[0]
+        self.assertEqual(core.list_preference(candidate, single), ())
+
+    def test_the_existing_tiers_still_decide_between_mixed_markets(self):
+        near = [self.row("superconductors", 600, market=1, distance=20),
+                self.row("semiconductors", 600, market=1, distance=20)]
+        far = [self.row("superconductors", 600, market=2, distance=300, buyPrice=1),
+               self.row("semiconductors", 600, market=2, distance=300, buyPrice=1)]
+        self.assertEqual([c.station for c in self.rank(*(far + near))], ["Port 1", "Port 2"])
+
+    def test_the_oldest_reading_speaks_for_the_market(self):
+        ranked = self.rank(self.row("superconductors", 600),
+                           self.row("semiconductors", 600, updatedAt=self.iso(hours=30)))
+        self.assertAlmostEqual(ranked[0].age_seconds, 30 * 3600.0)
+
+    def test_an_empty_or_unpriced_lot_contributes_nothing(self):
+        ranked = self.rank(self.row("superconductors", 2000),
+                           self.row("semiconductors", 0, updatedAt=self.iso(days=6)),
+                           self.row("computercomponents", 900, buyPrice=0))
+        self.assertEqual([lot.display for lot in ranked[0].lots], ["Superconductors"])
+        self.assertAlmostEqual(ranked[0].age_seconds, 600.0)
+
+    def test_a_commodity_that_was_not_listed_is_not_counted(self):
+        self.assertEqual(self.rank(self.row("superconductors", 600),
+                                   self.row("gold", 5000)), [])
+
+    def test_the_display_names_spansh_sends_are_recognised(self):
+        ranked = self.rank(self.row("Superconductors", 600),
+                           self.row("Computer Components", 600))
+        self.assertEqual([lot.ardent for lot in ranked[0].lots],
+                         ["superconductors", "computercomponents"])
+
+    def test_the_description_lists_what_to_load(self):
+        ranked = self.rank(self.row("superconductors", 500, buyPrice=6741),
+                           self.row("computercomponents", 9000, buyPrice=549))
+        lines = core.describe_candidate(ranked[0], self.spec)
+        self.assertEqual(lines[0], "BUY Superconductors +2 @ Port 1")
+        self.assertEqual(lines[2], "500 t Superconductors - 6,741 cr/t (500 t in stock)")
+        self.assertEqual(lines[3], "220 t Computer Components - 549 cr/t (9,000 t in stock)")
+        self.assertIn("10m ago", lines[4])
+
+    def test_the_forecast_needs_a_real_sell_price_for_every_planned_lot(self):
+        plan = self.rank(self.row("superconductors", 500, buyPrice=6000),
+                         self.row("semiconductors", 9000, buyPrice=1000))[0].plan
+        self.assertEqual(core.plan_profit_lines(plan, {"superconductors": 7000}), [])
+        self.assertEqual(
+            core.plan_profit_lines(plan, {"superconductors": 7000, "semiconductors": 1500}),
+            ["+847 cr/t avg - +610,000 cr/full hold"])
+
+    def test_a_single_commodity_run_is_described_exactly_as_before(self):
+        single = spec()
+        row = self.row("gold", 5000, buyPrice=45000)
+        lines = core.describe_candidate(
+            core.rank_candidates([row], single, now=self.now)[0], single)
+        self.assertEqual(lines, [
+            "BUY Gold @ Port 1",
+            "Sys 1 - 20.0 ly - ~1+1 jumps (est)",
+            "5,000 t - 45,000 cr/t - 10m ago",
+            "L pad - Coriolis - 200 Ls",
+        ])
+
+
+class MultiCommoditySearch(unittest.TestCase):
+    """The upstream answers for one commodity at a time, so the search asks once
+    per listed commodity per ring and merges what comes back."""
+
+    def setUp(self):
+        self.now = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
+        self.spec = spec(commodity_ardent="superconductors",
+                         commodity_display="Superconductors",
+                         also=(("semiconductors", "Semiconductors"),))
+
+    def row(self, commodity, stock, market=1, **kw):
+        base = {
+            "commodityName": commodity, "systemName": "Sys {}".format(market),
+            "stationName": "Port {}".format(market), "marketId": market,
+            "stationType": "Coriolis", "maxLandingPadSize": 3, "stock": stock,
+            "buyPrice": 1000, "distance": 20, "distanceToArrival": 200,
+            "updatedAt": (self.now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+        }
+        base.update(kw)
+        return base
+
+    def ok(self, rows, capped=False):
+        return edta_ardent.SearchResult(edta_ardent.OK, rows=rows, window_capped=capped)
+
+    def test_each_ring_asks_once_per_commodity_in_list_order(self):
+        calls = []
+
+        def fetch(commodity, radius, days):
+            calls.append((commodity, radius))
+            return self.ok([self.row(commodity, 600)])
+
+        outcome = session_mod.search_best(self.spec, fetch, now=self.now)
+        ring = self.spec.first_ring_ly
+        self.assertEqual(calls, [("superconductors", ring), ("semiconductors", ring)])
+        self.assertEqual(outcome.candidate.stock, 1200)
+        self.assertEqual(outcome.attempts[0].rows, 2)
+
+    def test_a_single_commodity_still_costs_one_request_a_ring(self):
+        calls = []
+
+        def fetch(commodity, radius, days):
+            calls.append(commodity)
+            return self.ok([])
+
+        session_mod.search_best(spec(), fetch, now=self.now)
+        self.assertEqual(len(calls), len(session_mod.escalation(spec())))
+        self.assertEqual(set(calls), {"gold"})
+
+    def test_lots_found_in_different_rings_still_add_up(self):
+        # Rings accumulate per commodity: a later ring that happens to omit a
+        # lot (the unsorted row cap) must not take it back out of the total.
+        seen = []
+
+        def fetch(commodity, radius, days):
+            seen.append(radius)
+            first = radius == self.spec.first_ring_ly
+            if commodity == "superconductors":
+                return self.ok([self.row(commodity, 600)] if first else [])
+            return self.ok([] if first else [self.row(commodity, 600)])
+
+        outcome = session_mod.search_best(self.spec, fetch, now=self.now)
+        self.assertGreater(len(set(seen)), 1)
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.candidate.stock, 1200)
+
+    def test_a_cap_on_any_one_commodity_stops_the_expansion(self):
+        calls = []
+
+        def fetch(commodity, radius, days):
+            calls.append((commodity, radius))
+            return self.ok([], capped=commodity == "superconductors")
+
+        outcome = session_mod.search_best(self.spec, fetch, now=self.now)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertTrue(outcome.window_capped)
+
+    def test_an_error_on_a_later_commodity_is_an_error(self):
+        def fetch(commodity, radius, days):
+            if commodity == "semiconductors":
+                return edta_ardent.SearchResult(edta_ardent.NETWORK, message="down")
+            return self.ok([self.row(commodity, 5000)])
+
+        outcome = session_mod.search_best(self.spec, fetch, now=self.now)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_kind, edta_ardent.NETWORK)
+
+    def test_spansh_is_asked_per_commodity_for_its_share_of_the_requirement(self):
+        # Pigeonhole: 1,080 t across two commodities means at least 540 t of one.
+        self.assertEqual(session_mod.spansh_min_supply(self.spec), 540)
+        self.assertEqual(session_mod.spansh_min_supply(spec()), 1080)
+        three = spec(also=(("silver", "Silver"), ("palladium", "Palladium")))
+        self.assertEqual(session_mod.spansh_min_supply(three), 360)
+
+    def test_spansh_rows_for_one_market_merge_across_its_commodity_queries(self):
+        stamp = (self.now - timedelta(minutes=20)).isoformat().replace("+00:00", "Z")
+        station = spansh_station(market_updated_at=stamp, type="Coriolis Starport", market=[
+            {"commodity": "Superconductors", "buy_price": 6741, "supply": 600},
+            {"commodity": "Semiconductors", "buy_price": 900, "supply": 600},
+        ])
+        rows = edta_spansh.normalise_rows(station, ["Superconductors", "Semiconductors"])
+        calls = []
+
+        def fetch(name, hours):
+            calls.append((name, hours))
+            return self.ok(rows)
+
+        outcome = session_mod.search_spansh(self.spec, fetch, now=self.now)
+        self.assertEqual(calls, [("Superconductors", 1.0), ("Semiconductors", 1.0)])
+        self.assertEqual(outcome.candidate.stock, 1200)       # not 2,400
+        self.assertEqual(outcome.source, "Spansh")
 
 
 class CommodityNames(unittest.TestCase):
@@ -422,6 +767,41 @@ class Validation(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertTrue(any("Laden" in w for w in result.warnings))
 
+    def test_a_comma_separated_list_is_kept_in_the_order_typed(self):
+        result = session_mod.validate(self.good(
+            commodity="Superconductors, semiconductors ,Computer Components"))
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.spec.commodities,
+                         (("superconductors", "Superconductors"),
+                          ("semiconductors", "Semiconductors"),
+                          ("computercomponents", "Computer Components")))
+
+    def test_a_single_commodity_has_no_extras(self):
+        self.assertEqual(session_mod.validate(self.good()).spec.also, ())
+
+    def test_one_typo_in_a_list_is_reported_with_suggestions(self):
+        result = session_mod.validate(self.good(commodity="Gold, Platnum, Silver"))
+        self.assertFalse(result.ok)
+        self.assertEqual(len(result.errors), 1, result.errors)
+        self.assertIn("Platinum", result.errors[0])
+
+    def test_duplicates_and_stray_commas_are_ignored(self):
+        result = session_mod.validate(self.good(commodity="Gold,, gold, $gold_name;, Silver,"))
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual([d for _, d in result.spec.commodities], ["Gold", "Silver"])
+
+    def test_the_list_is_capped(self):
+        result = session_mod.validate(self.good(
+            commodity="Gold, Silver, Palladium, Platinum, Tritium, Bauxite"))
+        self.assertFalse(result.ok)
+        self.assertTrue(any("at most" in e for e in result.errors), result.errors)
+        self.assertLessEqual(session_mod.MAX_COMMODITIES, 5)
+
+    def test_only_commas_is_still_no_commodity(self):
+        result = session_mod.validate(self.good(commodity=" , "))
+        self.assertFalse(result.ok)
+        self.assertTrue(any("No commodity" in e for e in result.errors), result.errors)
+
 
 class Escalation(unittest.TestCase):
     def test_the_search_starts_near_and_works_outward(self):
@@ -450,7 +830,7 @@ class Escalation(unittest.TestCase):
         now = fixture_now(rows)
         calls = []
 
-        def fetch(radius, days):
+        def fetch(commodity, radius, days):
             calls.append(radius)
             return edta_ardent.SearchResult(edta_ardent.OK, rows=rows)
 
@@ -477,7 +857,7 @@ class Escalation(unittest.TestCase):
                    distanceToArrival=50)
         target = spec(min_pad=1)
 
-        def fetch(radius, days):
+        def fetch(commodity, radius, days):
             # The near market appears ONLY in the first, complete ring.
             if radius == target.first_ring_ly:
                 return edta_ardent.SearchResult(edta_ardent.OK, rows=[near])
@@ -492,7 +872,7 @@ class Escalation(unittest.TestCase):
         now = fixture_now(rows)
         calls = []
 
-        def fetch(radius, days):
+        def fetch(commodity, radius, days):
             calls.append(radius)
             return edta_ardent.SearchResult(
                 edta_ardent.OK, rows=[dict(rows[0], stock=999999,
@@ -509,7 +889,7 @@ class Escalation(unittest.TestCase):
                      updatedAt=(now - timedelta(days=2)).isoformat().replace("+00:00", "Z"))
         calls = []
 
-        def fetch(radius, days):
+        def fetch(commodity, radius, days):
             calls.append(radius)
             return edta_ardent.SearchResult(edta_ardent.OK, rows=[stale])
 
@@ -522,7 +902,7 @@ class Escalation(unittest.TestCase):
         now = fixture_now(rows)
         calls = []
 
-        def fetch(radius, days):
+        def fetch(commodity, radius, days):
             calls.append((radius, days))
             hit = days > 7
             return edta_ardent.SearchResult(edta_ardent.OK, rows=rows if hit else [])
@@ -532,7 +912,7 @@ class Escalation(unittest.TestCase):
         self.assertTrue(any("days old" in note for note in outcome.relaxed), outcome.relaxed)
 
     def test_an_upstream_error_is_not_reported_as_nothing_found(self):
-        def fetch(radius, days):
+        def fetch(commodity, radius, days):
             return edta_ardent.SearchResult(edta_ardent.NOT_FOUND, message="no such system")
 
         outcome = session_mod.search_best(spec(), fetch)
@@ -608,6 +988,28 @@ class SpanshContract(unittest.TestCase):
         self.assertNotIn("Drake-Class Carrier", filters["type"]["value"])
         self.assertFalse([t for t in filters["type"]["value"] if "Depot" in t])
 
+    def test_one_station_yields_a_row_for_each_listed_commodity_it_stocks(self):
+        rows = edta_spansh.normalise_rows(spansh_station(), ["Silver", "Palladium", "gold"])
+        self.assertEqual([(row["commodityName"], row["stock"]) for row in rows],
+                         [("Silver", 9), ("Gold", 5000)])
+        self.assertEqual({row["marketId"] for row in rows}, {4359005955})
+
+    def test_extra_commodities_are_read_out_but_not_filtered_on(self):
+        captured = {}
+
+        class Recorder(edta_spansh.SpanshClient):
+            def _request(self, body, commodity_names):
+                captured["body"] = body
+                captured["names"] = list(commodity_names)
+                return edta_ardent.SearchResult(edta_ardent.OK, rows=[])
+
+        Recorder(user_agent="test").stations_selling(
+            "Sol", "Silver", 340, 540, True, 6, also_names=["Gold", "Silver"])
+        self.assertEqual(captured["names"], ["Silver", "Gold"])
+        market = captured["body"]["filters"]["market"]
+        self.assertEqual([entry["name"] for entry in market], ["Silver"])
+        self.assertEqual(market[0]["supply"]["value"][0], 540)
+
     def test_a_page_stays_small(self):
         # Every station costs ~123 KB; a casual bump here is megabytes a search.
         self.assertLessEqual(edta_spansh.PAGE_SIZE, 5)
@@ -642,9 +1044,9 @@ class Fallback(unittest.TestCase):
     def run_search(self, ardent, spansh):
         self.spansh_calls = []
 
-        def fallback(hours):
+        def fallback(commodity, hours):
             self.spansh_calls.append(hours)
-            return spansh(hours)
+            return spansh(commodity, hours)
 
         return session_mod.search_with_fallback(self.target, ardent, fallback, now=self.now)
 
@@ -652,8 +1054,8 @@ class Fallback(unittest.TestCase):
         return edta_ardent.SearchResult(edta_ardent.OK, rows=rows)
 
     def test_a_fresh_ardent_answer_never_touches_spansh(self):
-        outcome = self.run_search(lambda r, d: self.ok(self.rows),
-                                  lambda h: self.ok([self.spansh_row()]))
+        outcome = self.run_search(lambda c, r, d: self.ok(self.rows),
+                                  lambda c, h: self.ok([self.spansh_row()]))
         self.assertTrue(outcome.ok)
         self.assertEqual(outcome.source, "Ardent")
         self.assertEqual(self.spansh_calls, [])
@@ -662,8 +1064,8 @@ class Fallback(unittest.TestCase):
         # The October 2026 outage: every Ardent row frozen at the same hour.
         stalled = [self.ardent_row(marketId=1, updatedAt=self.stamp(hours=28)),
                    self.ardent_row(marketId=2, updatedAt=self.stamp(hours=29))]
-        outcome = self.run_search(lambda r, d: self.ok(stalled),
-                                  lambda h: self.ok([self.spansh_row()]))
+        outcome = self.run_search(lambda c, r, d: self.ok(stalled),
+                                  lambda c, h: self.ok([self.spansh_row()]))
         self.assertEqual(outcome.source, "Spansh")
         self.assertEqual(outcome.candidate.station, "Thorn Constructions")
         self.assertIn("Ardent data stale - using Spansh", outcome.relaxed)
@@ -673,52 +1075,52 @@ class Fallback(unittest.TestCase):
         # ones: a just-updated market with no stock still shows Ardent ingesting.
         rows = [self.ardent_row(marketId=1, updatedAt=self.stamp(hours=28)),
                 self.ardent_row(marketId=2, stock=0, updatedAt=self.stamp(minutes=5))]
-        outcome = self.run_search(lambda r, d: self.ok(rows),
-                                  lambda h: self.ok([self.spansh_row()]))
+        outcome = self.run_search(lambda c, r, d: self.ok(rows),
+                                  lambda c, h: self.ok([self.spansh_row()]))
         self.assertEqual(outcome.source, "Ardent")
         self.assertEqual(self.spansh_calls, [])
 
     def test_an_ardent_error_falls_back(self):
         outcome = self.run_search(
-            lambda r, d: edta_ardent.SearchResult(edta_ardent.NETWORK, message="down"),
-            lambda h: self.ok([self.spansh_row()]))
+            lambda c, r, d: edta_ardent.SearchResult(edta_ardent.NETWORK, message="down"),
+            lambda c, h: self.ok([self.spansh_row()]))
         self.assertTrue(outcome.ok)
         self.assertEqual(outcome.source, "Spansh")
         self.assertIn("Ardent unavailable - using Spansh", outcome.relaxed)
 
     def test_an_empty_ardent_falls_back(self):
-        outcome = self.run_search(lambda r, d: self.ok([]),
-                                  lambda h: self.ok([self.spansh_row()]))
+        outcome = self.run_search(lambda c, r, d: self.ok([]),
+                                  lambda c, h: self.ok([self.spansh_row()]))
         self.assertEqual(outcome.source, "Spansh")
         self.assertIn("Ardent found nothing - using Spansh", outcome.relaxed)
 
     def test_a_failing_spansh_leaves_the_ardent_outcome_alone(self):
         stalled = [self.ardent_row(marketId=1, updatedAt=self.stamp(hours=28))]
         outcome = self.run_search(
-            lambda r, d: self.ok(stalled),
-            lambda h: edta_ardent.SearchResult(edta_ardent.NETWORK, message="down"))
+            lambda c, r, d: self.ok(stalled),
+            lambda c, h: edta_ardent.SearchResult(edta_ardent.NETWORK, message="down"))
         self.assertTrue(outcome.ok)
         self.assertEqual(outcome.source, "Ardent")
         self.assertFalse([note for note in outcome.relaxed if "Spansh" in note])
 
     def test_both_failing_reports_the_ardent_error(self):
         outcome = self.run_search(
-            lambda r, d: edta_ardent.SearchResult(edta_ardent.NOT_FOUND, message="no such system"),
-            lambda h: edta_ardent.SearchResult(edta_ardent.NOT_FOUND, message="spansh says no"))
+            lambda c, r, d: edta_ardent.SearchResult(edta_ardent.NOT_FOUND, message="no such system"),
+            lambda c, h: edta_ardent.SearchResult(edta_ardent.NOT_FOUND, message="spansh says no"))
         self.assertEqual(outcome.error_message, "no such system")
 
     def test_spansh_must_rank_better_to_win(self):
         stalled = [self.ardent_row(marketId=1, updatedAt=self.stamp(hours=28))]
         older = self.spansh_row(updatedAt=self.stamp(days=5))
-        outcome = self.run_search(lambda r, d: self.ok(stalled), lambda h: self.ok([older]))
+        outcome = self.run_search(lambda c, r, d: self.ok(stalled), lambda c, h: self.ok([older]))
         self.assertEqual(outcome.source, "Ardent")
 
     def test_the_recency_window_widens_a_band_at_a_time_and_stops_at_a_hit(self):
         windows = session_mod.spansh_windows(self.target)
         self.assertEqual(windows, [1.0, 6.0, 24.0, 72.0, 168.0])
         hit = self.spansh_row(updatedAt=self.stamp(hours=10))
-        outcome = self.run_search(lambda r, d: self.ok([]),
-                                  lambda h: self.ok([hit] if h >= 24 else []))
+        outcome = self.run_search(lambda c, r, d: self.ok([]),
+                                  lambda c, h: self.ok([hit] if h >= 24 else []))
         self.assertTrue(outcome.ok)
         self.assertEqual(self.spansh_calls, [1.0, 6.0, 24.0])
 
@@ -733,14 +1135,14 @@ class Fallback(unittest.TestCase):
         good = self.spansh_row(marketId=7, stationName="Bigger",
                                updatedAt=self.stamp(hours=3))
         self.target = spec(min_pad=2)
-        outcome = self.run_search(lambda r, d: self.ok([]),
-                                  lambda h: self.ok([small] if h < 6 else [small, good]))
+        outcome = self.run_search(lambda c, r, d: self.ok([]),
+                                  lambda c, h: self.ok([small] if h < 6 else [small, good]))
         self.assertEqual(outcome.candidate.station, "Bigger")
         self.assertEqual(self.spansh_calls, [1.0, 6.0])
 
     def test_without_a_fallback_the_ardent_outcome_is_returned(self):
         outcome = session_mod.search_with_fallback(
-            self.target, lambda r, d: self.ok([]), None, now=self.now)
+            self.target, lambda c, r, d: self.ok([]), None, now=self.now)
         self.assertFalse(outcome.ok)
 
 
@@ -843,7 +1245,7 @@ class SessionProfitFromJournal(unittest.TestCase):
         generation, search_spec = effects[-1].payload
         outcome = session_mod.search_best(
             search_spec,
-            lambda r, d: edta_ardent.SearchResult(edta_ardent.OK, rows=self.rows),
+            lambda c, r, d: edta_ardent.SearchResult(edta_ardent.OK, rows=self.rows),
             now=self.now)
         self.session.apply_outcome(generation, outcome)
         return self.session.target
@@ -1015,6 +1417,104 @@ class SessionProfitFromJournal(unittest.TestCase):
         self.assertIsNone(session.ledger.started_at)
 
 
+class MixedHoldSession(unittest.TestCase):
+    """A run listing two commodities, through the real state machine."""
+
+    def setUp(self):
+        self.now = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
+        self.session = session_mod.Session()
+        params = session_mod.Params(sell_system="Sol", commodity="Gold, Silver",
+                                    cargo_capacity="200", unladen_range="50",
+                                    laden_range="40", min_pad="M")
+        validation, effects = self.session.start(params, now=self.now)
+        self.assertTrue(validation.ok)
+        generation, search_spec = effects[-1].payload
+        stamp = (self.now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+
+        def fetch(commodity, radius, days):
+            stock, price = {"gold": (120, 45000), "silver": (400, 4000)}[commodity]
+            return edta_ardent.SearchResult(edta_ardent.OK, rows=[{
+                "commodityName": commodity, "systemName": "Veren's Stop",
+                "stationName": "Duncan's Den", "stationType": "Orbis", "marketId": 77,
+                "maxLandingPadSize": 3, "stock": stock, "buyPrice": price,
+                "distance": 33, "distanceToArrival": 10, "updatedAt": stamp}])
+
+        self.session.apply_outcome(
+            generation, session_mod.search_best(search_spec, fetch, now=self.now))
+        self.assertEqual(self.session.state, session_mod.TO_BUY)
+
+    def dock(self, system, station, market_id):
+        return self.session.on_journal(
+            {"event": "Docked", "StarSystem": system, "StationName": station,
+             "MarketID": market_id}, {})
+
+    def sell(self, commodity, count, total, **overrides):
+        entry = {"event": "MarketSell", "Type": commodity, "Count": count,
+                 "timestamp": (self.now + timedelta(minutes=30)).isoformat().replace(
+                     "+00:00", "Z"),
+                 "TotalSale": total}
+        entry.update(overrides)
+        return self.session.on_journal(entry, {})
+
+    def test_the_buy_block_names_both_lots_in_list_order(self):
+        lines, role = self.session.display_lines(now=self.now)
+        self.assertEqual(role, "buy")
+        self.assertEqual(lines[0], "BUY Gold +1 @ Duncan's Den")
+        self.assertEqual(lines[2], "120 t Gold - 45,000 cr/t (120 t in stock)")
+        self.assertEqual(lines[3], "80 t Silver - 4,000 cr/t (400 t in stock)")
+
+    def test_sales_of_every_listed_commodity_are_booked(self):
+        self.dock("Veren's Stop", "Duncan's Den", 77)
+        self.dock("Sol", "Abraham Lincoln", 128016384)
+        self.sell("gold", 120, 6_000_000, AvgPricePaid=45000)
+        self.sell("$silver_name;", 80, 400_000, AvgPricePaid=4000)
+        self.sell("palladium", 5, 999_999, AvgPricePaid=1)
+        self.assertEqual(self.session.ledger.sales, 2)
+        self.assertEqual(self.session.ledger.tonnes, 200)
+        self.assertEqual(self.session.ledger.credits,
+                         (6_000_000 - 45000 * 120) + (400_000 - 4000 * 80))
+
+    def test_a_missing_avgpricepaid_uses_that_commoditys_own_planned_price(self):
+        """Not the other commodity's, and not the blended price of the hold."""
+        self.dock("Veren's Stop", "Duncan's Den", 77)
+        self.dock("Sol", "Abraham Lincoln", 128016384)
+        self.sell("silver", 80, 400_000)
+        self.assertEqual(self.session.ledger.credits, 400_000 - 4000 * 80)
+        self.sell("gold", 120, 6_000_000)
+        self.assertEqual(self.session.ledger.credits,
+                         (400_000 - 4000 * 80) + (6_000_000 - 45000 * 120))
+        self.assertTrue(self.session.ledger.estimated)
+
+    def test_a_marketbuy_overrides_only_its_own_commodity(self):
+        self.dock("Veren's Stop", "Duncan's Den", 77)
+        self.session.on_journal({"event": "MarketBuy", "Type": "silver", "Count": 80,
+                                 "BuyPrice": 3500}, {})
+        self.dock("Sol", "Abraham Lincoln", 128016384)
+        self.sell("silver", 80, 400_000)
+        self.sell("gold", 120, 6_000_000)
+        self.assertEqual(self.session.ledger.credits,
+                         (400_000 - 3500 * 80) + (6_000_000 - 45000 * 120))
+
+    def test_the_forecast_waits_for_every_sell_price(self):
+        def forecast():
+            lines, _ = self.session.display_lines(now=self.now)
+            return [line for line in lines if "cr/full hold" in line]
+
+        self.assertEqual(forecast(), [])
+        self.session.sell_prices = {"gold": 50000}
+        self.assertEqual(forecast(), [])
+        self.session.sell_prices = {"gold": 50000, "silver": 5000}
+        self.assertEqual(forecast(), ["+3,400 cr/t avg - +680,000 cr/full hold"])
+        self.dock("Veren's Stop", "Duncan's Den", 77)
+        self.assertEqual(forecast(), ["+3,400 cr/t avg - +680,000 cr/full hold"])
+
+    def test_the_return_leg_and_status_use_the_short_label(self):
+        self.dock("Veren's Stop", "Duncan's Den", 77)
+        lines, role = self.session.display_lines(now=self.now)
+        self.assertEqual(role, "sell")
+        self.assertEqual(lines[0], "SELL Gold +1 @ Sol")
+
+
 class FullCycle(unittest.TestCase):
     """Dock in the sell system, fly out, dock at the buy station, come back."""
 
@@ -1032,7 +1532,7 @@ class FullCycle(unittest.TestCase):
         generation, search_spec = self.effects[-1].payload
         outcome = session_mod.search_best(
             search_spec,
-            lambda r, d: edta_ardent.SearchResult(edta_ardent.OK, rows=self.rows),
+            lambda c, r, d: edta_ardent.SearchResult(edta_ardent.OK, rows=self.rows),
             now=self.now)
         return generation, outcome
 
@@ -1117,11 +1617,27 @@ class NoResults(unittest.TestCase):
         _, effects = state.start(params)
         generation, search_spec = effects[-1].payload
         outcome = session_mod.search_best(
-            search_spec, lambda r, d: edta_ardent.SearchResult(edta_ardent.OK, rows=[]))
+            search_spec, lambda c, r, d: edta_ardent.SearchResult(edta_ardent.OK, rows=[]))
         state.apply_outcome(generation, outcome)
         self.assertEqual(state.state, session_mod.NO_RESULTS)
         self.assertIn("1,080", state.message)
         self.assertIn("L pad", state.message)
+        self.assertIn("t of Gold on", state.message)
+
+    def test_a_list_is_named_in_full_and_as_a_combined_requirement(self):
+        state = session_mod.Session()
+        params = session_mod.Params(sell_system="Sol",
+                                    commodity="Gold, Silver, Palladium",
+                                    cargo_capacity="720", unladen_range="50",
+                                    laden_range="40", min_pad="L")
+        _, effects = state.start(params)
+        generation, search_spec = effects[-1].payload
+        outcome = session_mod.search_best(
+            search_spec, lambda c, r, d: edta_ardent.SearchResult(edta_ardent.OK, rows=[]))
+        state.apply_outcome(generation, outcome)
+        self.assertEqual(state.state, session_mod.NO_RESULTS)
+        self.assertIn("1,080 t of Gold, Silver or Palladium combined on a L pad",
+                      state.message)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """EDTradeAssist - a targeted commodity-hauling assistant for EDMC.
 
-You fix a commodity and a sell system; the plugin picks the buy location for each
+You fix a commodity (or a short list of them) and a sell system; the plugin picks the buy location for each
 run, puts the system name you need on the clipboard at each leg, and shows the run
 on the in-game overlay. Dock, paste, fly, buy, paste, fly, sell, repeat.
 
@@ -32,7 +32,7 @@ import edta_session as session_mod
 import edta_settings
 import edta_spansh
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 plugin_version = __version__
 
 PLUGIN_NAME = "EDTradeAssist"
@@ -121,17 +121,25 @@ class Plugin:
                 self.tasks.task_done()
 
     def _fetch_for(self, spec: core.SearchSpec):
-        def fetch(radius: float, max_days: int):
+        # With one commodity the upstream can filter on the full requirement.
+        # With several it cannot: a market qualifies on its COMBINED stock, so
+        # any lot at all may be the one that tips it over.
+        min_volume = spec.min_volume if not spec.also else 1
+
+        def fetch(commodity: str, radius: float, max_days: int):
             return self.client.nearby_exports(
-                spec.sell_system, spec.commodity_ardent, radius, spec.min_volume,
-                max_days_ago=max_days)
+                spec.sell_system, commodity, radius, min_volume, max_days_ago=max_days)
         return fetch
 
     def _fallback_fetch_for(self, spec: core.SearchSpec):
-        def fetch(updated_within_h: float):
+        names = [display for _, display in spec.commodities]
+        min_supply = session_mod.spansh_min_supply(spec)
+
+        def fetch(commodity_name: str, updated_within_h: float):
             return self.spansh.stations_selling(
-                spec.sell_system, spec.commodity_display, spec.radius_ly, spec.min_volume,
-                large_pad_only=spec.min_pad >= 3, updated_within_h=updated_within_h)
+                spec.sell_system, commodity_name, spec.radius_ly, min_supply,
+                large_pad_only=spec.min_pad >= 3, updated_within_h=updated_within_h,
+                also_names=names)
         return fetch
 
     def _wake_ui(self) -> None:
@@ -185,7 +193,7 @@ class Plugin:
         self.status_var.set("{}{}".format(
             state.status_line(),
             "" if not state.spec else "  -  {} to {}".format(
-                state.spec.commodity_display, state.spec.sell_system)))
+                state.spec.label, state.spec.sell_system)))
 
         lines, role = state.display_lines()
         if not lines and state.message:
@@ -358,7 +366,8 @@ def _build_setup(parent) -> tk.Frame:
     tk.Entry(system_row, textvariable=make_var("sell_system")).grid(row=0, column=0, sticky=tk.EW)
     tk.Button(system_row, text="Here", command=_fill_here).grid(row=0, column=1, padx=(4, 0))
 
-    tk.Label(setup, text="Commodity").grid(row=1, column=0, sticky=tk.W)
+    # One commodity, or several separated by commas - the first is loaded first.
+    tk.Label(setup, text="Commodities").grid(row=1, column=0, sticky=tk.W)
     tk.Entry(setup, textvariable=make_var("commodity")).grid(row=1, column=1, sticky=tk.EW)
 
     tk.Label(setup, text="Cargo / pad").grid(row=2, column=0, sticky=tk.W)
@@ -531,13 +540,16 @@ def _refresh_sell_price(entry: Dict[str, Any]) -> None:
     market = _read_market_json(market_id)
     if not market:
         return
-    key = state.spec.commodity_ardent
+    prices: Dict[str, int] = {}
     for item in market.get("Items") or ():
         name = (item.get("Name") or "").strip()
-        if _names_match(name, key):
-            price = int(item.get("SellPrice") or 0)
-            state.sell_price = price if price > 0 else None
-            return
+        for ardent, _ in state.spec.commodities:
+            if _names_match(name, ardent):
+                price = int(item.get("SellPrice") or 0)
+                if price > 0:
+                    prices[ardent] = price
+    if prices:
+        state.sell_prices = prices
 
 
 def _names_match(journal_name: str, ardent_name: str) -> bool:

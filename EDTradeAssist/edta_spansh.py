@@ -29,6 +29,14 @@ Upstream behaviours worth knowing, each verified live 2026-10-10:
   * Commodities go by their display name ("Computer Components"), not the symbol.
   * The `market_updated_at` range filter is honoured.
 
+SEVERAL COMMODITIES. The market filter matches one commodity per request here,
+so a run listing three asks three times per recency window. Because each station
+arrives with its whole market, every listed commodity it stocks is read from the
+one answer (normalise_rows) and the combined stock is exact. What is NOT exact
+is discovery: each request returns the nearest PAGE_SIZE stations holding enough
+of ITS commodity, so a market that only qualifies on the combination can sit
+just outside every page. Acceptable for a fallback; do not raise PAGE_SIZE.
+
 Nothing here raises: every call returns a SearchResult.
 """
 
@@ -39,7 +47,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from edta_ardent import (BAD_REQUEST, DEFAULT_CACHE_TTL, DEFAULT_MIN_INTERVAL,
                          DEFAULT_TIMEOUT, HTTP, NETWORK, NOT_FOUND, OK, SearchResult,
@@ -77,15 +85,29 @@ _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 def normalise_row(station: Dict[str, Any], commodity_name: str) -> Optional[Dict[str, Any]]:
     """One Spansh station -> one Ardent-shaped row, or None when the station's
     market does not list the commodity after all."""
-    if not isinstance(station, dict):
-        return None
-    wanted = (commodity_name or "").casefold()
-    entry = next((item for item in station.get("market") or ()
-                  if isinstance(item, dict)
-                  and (item.get("commodity") or "").casefold() == wanted), None)
-    if entry is None:
-        return None
+    rows = normalise_rows(station, [commodity_name])
+    return rows[0] if rows else None
 
+
+def normalise_rows(station: Dict[str, Any], commodity_names: Sequence[str]
+                   ) -> List[Dict[str, Any]]:
+    """One Spansh station -> one Ardent-shaped row for EACH of the named
+    commodities its market lists, in the order named. The station's whole market
+    is in the response whether we want it or not, so a run hauling several
+    commodities learns all of them from a single hit."""
+    if not isinstance(station, dict):
+        return []
+    listed = {(item.get("commodity") or "").casefold(): item
+              for item in station.get("market") or () if isinstance(item, dict)}
+    rows = []
+    for name in commodity_names:
+        entry = listed.get((name or "").casefold())
+        if entry is not None:
+            rows.append(_row(station, entry))
+    return rows
+
+
+def _row(station: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
     if station.get("large_pads"):
         pad = 3
     elif station.get("medium_pads"):
@@ -213,9 +235,14 @@ class SpanshClient:
     def stations_selling(self, system: str, commodity_name: str, max_distance: float,
                          min_volume: int, large_pad_only: bool, updated_within_h: float,
                          size: int = PAGE_SIZE, now: Optional[datetime] = None,
-                         use_cache: bool = True) -> SearchResult:
+                         use_cache: bool = True,
+                         also_names: Sequence[str] = ()) -> SearchResult:
         """The nearest markets around `system` that will sell `commodity_name` to
-        you and were updated in the last `updated_within_h` hours."""
+        you and were updated in the last `updated_within_h` hours.
+
+        `also_names` are further commodities to report from the same stations:
+        they are not filtered on, only read out of the markets that come back.
+        """
         system = (system or "").strip()
         commodity_name = (commodity_name or "").strip()
         if not system or not commodity_name:
@@ -226,8 +253,11 @@ class SpanshClient:
                 message="Spansh searches are kept within {:.0f} ly.".format(MAX_DISTANCE_LY))
 
         # The window's start moves with the clock, so it stays out of the key.
-        key = (system.casefold(), commodity_name.casefold(), round(float(max_distance), 1),
-               int(min_volume), bool(large_pad_only), float(updated_within_h), int(size))
+        names = [commodity_name] + [name for name in also_names
+                                    if name and name.casefold() != commodity_name.casefold()]
+        key = (system.casefold(), tuple(name.casefold() for name in names),
+               round(float(max_distance), 1), int(min_volume), bool(large_pad_only),
+               float(updated_within_h), int(size))
         if use_cache:
             with self._cache_lock:
                 entry = self._cache.get(key)
@@ -239,13 +269,13 @@ class SpanshClient:
         body = self.build_body(system, commodity_name, max_distance, min_volume,
                                large_pad_only, updated_within_h, size,
                                now or datetime.now(timezone.utc))
-        result = self._request(body, commodity_name)
+        result = self._request(body, names)
         if result.kind in (OK, NOT_FOUND):
             with self._cache_lock:
                 self._cache[key] = (time.monotonic(), result)
         return result
 
-    def _request(self, body: Dict[str, Any], commodity_name: str) -> SearchResult:
+    def _request(self, body: Dict[str, Any], commodity_names: Sequence[str]) -> SearchResult:
         url = self.base_url + SEARCH_PATH
         self._limiter.wait()
         try:
@@ -271,9 +301,7 @@ class SpanshClient:
         stations = payload.get("results") if isinstance(payload, dict) else None
         rows: List[Dict[str, Any]] = []
         for station in stations or ():
-            row = normalise_row(station, commodity_name)
-            if row is not None:
-                rows.append(row)
+            rows.extend(normalise_rows(station, commodity_names))
         return SearchResult(OK, rows=rows, url=url)
 
 
@@ -300,6 +328,9 @@ def _self_test() -> None:
     assert row["maxLandingPadSize"] == 3 and row["marketId"] == 4359005955, row
     assert row["updatedAt"] == "2026-10-10T12:24:41Z"
     assert normalise_row(station, "Gold") is None
+    several = normalise_rows(station, ["Gold", "Superconductors", "Computer Components"])
+    assert [r["commodityName"] for r in several] == ["Superconductors", "Computer Components"]
+    assert [r["stock"] for r in several] == [596, 125320], several
 
     client = SpanshClient(user_agent="EDTradeAssist-selftest/0")
     assert client.stations_selling("", "Gold", 50, 100, True, 1).kind == BAD_REQUEST
